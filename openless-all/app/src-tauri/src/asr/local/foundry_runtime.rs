@@ -159,6 +159,9 @@ mod imp {
         }
 
         pub async fn release_now(&self) -> Result<()> {
+            // 先请求取消 prepare，避免 release 在 prepare 进行中（模型下载/加载）时永久
+            // 等待 lifecycle 锁；prepare 检测到 cancel_prepare=true 后会中止并释放锁。
+            self.cancel_prepare.store(true, Ordering::SeqCst);
             let _lifecycle = self.lifecycle.lock().await;
             self.release_now_locked().await
         }

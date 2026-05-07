@@ -1099,13 +1099,26 @@ fn reject_bare_shift_dictation_shortcut(binding: &ShortcutBinding) -> Result<(),
 }
 
 fn sync_dictation_hotkey_legacy_fields(prefs: &mut UserPreferences) {
+    use crate::types::HotkeyKey;
     if let Some(trigger) = crate::shortcut_binding::legacy_modifier_trigger(&prefs.dictation_hotkey)
     {
+        // 同步 hotkey.keys，避免 keys 里留着旧的快捷键值导致 QaPanel / Settings
+        // 标签显示错误（例如改成 Right Alt 后标签仍显示"右 Ctrl"）。
+        let codes = crate::types::HotkeyBinding {
+            trigger,
+            mode: prefs.hotkey.mode,
+            keys: None,
+        }
+        .effective_codes();
         prefs.hotkey.trigger = trigger;
+        prefs.hotkey.keys = Some(codes.into_iter().map(HotkeyKey::new).collect());
         prefs.custom_combo_hotkey = None;
         return;
     }
     prefs.hotkey.trigger = crate::types::HotkeyTrigger::Custom;
+    // 清除可能存在的旧 keys，使 effective_codes() 回落到 trigger 解析。
+    // 自定义组合键若通过新版 HotkeyRecorder UI 设置，录制器会直接写入 hotkey.keys。
+    prefs.hotkey.keys = None;
     prefs.custom_combo_hotkey = if prefs.dictation_hotkey.primary.trim().is_empty() {
         None
     } else {
@@ -1561,7 +1574,8 @@ mod tests {
     };
     use crate::persistence::CredentialsSnapshot;
     use crate::types::{
-        ComboBinding, HotkeyBinding, HotkeyMode, HotkeyTrigger, ShortcutBinding, UserPreferences,
+        ComboBinding, HotkeyBinding, HotkeyKey, HotkeyMode, HotkeyTrigger, ShortcutBinding,
+        UserPreferences,
     };
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -1917,6 +1931,59 @@ mod tests {
 
         assert_eq!(prefs.hotkey.trigger, HotkeyTrigger::Custom);
         assert!(prefs.custom_combo_hotkey.is_none());
+    }
+
+    #[test]
+    fn sync_dictation_hotkey_syncs_keys_for_modifier_trigger() {
+        // 修改前：hotkey.keys 残留旧值（如来自 HotkeyRecorder 的组合键）；
+        // 修改后：切换到修饰键触发时，keys 应同步为对应 DOM 键码，避免
+        // QaPanel / Settings 标签停留在旧值。
+        let mut prefs = UserPreferences {
+            hotkey: HotkeyBinding {
+                trigger: HotkeyTrigger::Custom,
+                mode: HotkeyMode::Toggle,
+                keys: Some(vec![
+                    HotkeyKey::new("ControlLeft"),
+                    HotkeyKey::new("KeyD"),
+                ]),
+            },
+            dictation_hotkey: ShortcutBinding {
+                primary: "RightControl".into(),
+                modifiers: vec![],
+            },
+            ..Default::default()
+        };
+
+        super::sync_dictation_hotkey_legacy_fields(&mut prefs);
+
+        assert_eq!(prefs.hotkey.trigger, HotkeyTrigger::RightControl);
+        let keys = prefs.hotkey.keys.expect("keys populated for modifier trigger");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].code, "ControlRight");
+    }
+
+    #[test]
+    fn sync_dictation_hotkey_clears_stale_keys_for_custom_trigger() {
+        // 切换到自定义组合键时应清除旧 keys，避免 effective_codes() 仍返回
+        // 已过时的修饰键码。
+        let mut prefs = UserPreferences {
+            hotkey: HotkeyBinding {
+                trigger: HotkeyTrigger::RightControl,
+                mode: HotkeyMode::Toggle,
+                keys: Some(vec![HotkeyKey::new("ControlRight")]),
+            },
+            dictation_hotkey: ShortcutBinding {
+                primary: "D".into(),
+                modifiers: vec!["cmd".into()],
+            },
+            ..Default::default()
+        };
+
+        super::sync_dictation_hotkey_legacy_fields(&mut prefs);
+
+        assert_eq!(prefs.hotkey.trigger, HotkeyTrigger::Custom);
+        assert!(prefs.hotkey.keys.is_none(), "stale keys should be cleared");
+        assert!(prefs.custom_combo_hotkey.is_some());
     }
 
     #[test]
