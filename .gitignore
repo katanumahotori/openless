@@ -43,3 +43,18 @@ openless-all/app/windows-ime/obj/
 
 # Planning docs are kept local only, not published to the public repo.
 docs/plans/
+
+# Developer-local helper scripts (do not commit)
+/dev.ps1
+/check.ps1
+/create_shortcut.ps1
+/disable_translation_hotkey.ps1
+/OpenLess-Restart.bat
+/inspect_db.py
+
+# Local logs
+/tauri_dev.log
+/npm_ci.log
+
+# 試用メモ
+/OpenLess試用メモ.md

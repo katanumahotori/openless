@@ -1,4 +1,4 @@
-﻿## 摘要
+## 摘要
 
 Closes #98  
 References #143
