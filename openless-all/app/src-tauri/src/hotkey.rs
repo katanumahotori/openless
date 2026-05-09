@@ -587,6 +587,7 @@ mod platform {
     const VK_RSHIFT: u32 = 0xA1;
     const VK_LCONTROL: u32 = 0xA2;
     const VK_RCONTROL: u32 = 0xA3;
+    const VK_LMENU: u32 = 0xA4;
     const VK_RMENU: u32 = 0xA5;
     const VK_RWIN: u32 = 0x5C;
     const LLKHF_INJECTED: u32 = 0x0000_0010;
@@ -837,18 +838,15 @@ mod platform {
     }
 
     fn trigger_to_vk_code(trigger: HotkeyTrigger) -> u32 {
-        // Windows only gives us a small set of modifier virtual keys that can be
-        // used as reliable modifier-only global triggers, so the cross-platform
-        // trigger list intentionally collapses a few aliases onto the same
-        // physical Windows key:
-        // - LeftOption reuses RightAlt / VK_RMENU
-        // - Fn reuses RightControl / VK_RCONTROL
+        // Windows 低层 hook 能区分左右 Alt，LeftOption / RightOption 必须保留物理侧。
+        // 其他少量跨平台别名仍按 Windows 可用物理键折叠：
+        // - Fn 复用 RightControl / VK_RCONTROL
         match trigger {
             HotkeyTrigger::RightControl => VK_RCONTROL,
             HotkeyTrigger::LeftControl => VK_LCONTROL,
             HotkeyTrigger::RightOption | HotkeyTrigger::RightAlt => VK_RMENU,
             HotkeyTrigger::RightCommand => VK_RWIN,
-            HotkeyTrigger::LeftOption => VK_RMENU,
+            HotkeyTrigger::LeftOption => VK_LMENU,
             HotkeyTrigger::Fn => VK_RCONTROL,
             HotkeyTrigger::Custom => unreachable!("custom combo hotkeys use ComboHotkeyMonitor"),
         }
@@ -856,6 +854,151 @@ mod platform {
 
     fn accept_injected_events() -> bool {
         std::env::var(ACCEPT_INJECTED_ENV).ok().as_deref() == Some("1")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use parking_lot::RwLock;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+
+        fn shared(trigger: HotkeyTrigger) -> Arc<Shared> {
+            Arc::new(Shared {
+                binding: RwLock::new(HotkeyBinding {
+                    trigger,
+                    mode: crate::types::HotkeyMode::Toggle,
+                    keys: None,
+                }),
+                trigger_held: AtomicBool::new(false),
+                qa_trigger: RwLock::new(None),
+                qa_trigger_held: AtomicBool::new(false),
+                translation_trigger: RwLock::new(None),
+                translation_trigger_held: AtomicBool::new(false),
+                translation_modifier_held: AtomicBool::new(false),
+            })
+        }
+
+        fn callback_context(shared: Arc<Shared>) -> (CallbackContext, mpsc::Receiver<HotkeyEvent>) {
+            let (tx, rx) = mpsc::channel();
+            (
+                CallbackContext {
+                    shared,
+                    tx,
+                    hook: std::sync::Mutex::new(None),
+                },
+                rx,
+            )
+        }
+
+        fn drain(rx: &mpsc::Receiver<HotkeyEvent>) -> Vec<HotkeyEvent> {
+            rx.try_iter().collect()
+        }
+
+        #[test]
+        fn windows_modifier_edges_are_deduped_from_mock_hook_events() {
+            let shared = shared(HotkeyTrigger::RightControl);
+            let (ctx, rx) = callback_context(shared);
+
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYDOWN));
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYDOWN));
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYUP));
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYUP));
+
+            assert_eq!(
+                drain(&rx),
+                vec![HotkeyEvent::Pressed, HotkeyEvent::Released]
+            );
+        }
+
+        #[test]
+        fn windows_modifier_edges_ignore_unrelated_keys_and_reemit_after_release() {
+            let shared = shared(HotkeyTrigger::RightControl);
+            let (ctx, rx) = callback_context(shared);
+
+            assert!(!dispatch_keyboard_event(&ctx, VK_LCONTROL, WM_KEYDOWN));
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYUP));
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYDOWN));
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYUP));
+            assert!(dispatch_keyboard_event(&ctx, VK_RCONTROL, WM_KEYDOWN));
+
+            assert_eq!(
+                drain(&rx),
+                vec![
+                    HotkeyEvent::Pressed,
+                    HotkeyEvent::Released,
+                    HotkeyEvent::Pressed
+                ]
+            );
+        }
+
+        #[test]
+        fn windows_optional_modifier_shortcuts_use_independent_latches() {
+            let shared = shared(HotkeyTrigger::RightControl);
+            *shared.qa_trigger.write() = Some(HotkeyTrigger::RightCommand);
+            *shared.translation_trigger.write() = Some(HotkeyTrigger::LeftOption);
+            let (ctx, rx) = callback_context(shared);
+
+            dispatch_keyboard_event(&ctx, VK_RWIN, WM_KEYDOWN);
+            dispatch_keyboard_event(&ctx, VK_RWIN, WM_KEYDOWN);
+            dispatch_keyboard_event(&ctx, VK_LMENU, WM_KEYDOWN);
+            dispatch_keyboard_event(&ctx, VK_LSHIFT, WM_KEYDOWN);
+            dispatch_keyboard_event(&ctx, VK_LSHIFT, WM_KEYDOWN);
+            dispatch_keyboard_event(&ctx, VK_RWIN, WM_KEYUP);
+            dispatch_keyboard_event(&ctx, VK_RWIN, WM_KEYDOWN);
+
+            assert_eq!(
+                drain(&rx),
+                vec![
+                    HotkeyEvent::QaShortcutPressed,
+                    HotkeyEvent::TranslationModifierPressed,
+                    HotkeyEvent::TranslationModifierPressed,
+                    HotkeyEvent::QaShortcutPressed,
+                ]
+            );
+        }
+
+        #[test]
+        fn windows_option_triggers_keep_left_and_right_alt_separate() {
+            let left_shared = shared(HotkeyTrigger::LeftOption);
+            let (left_ctx, left_rx) = callback_context(left_shared);
+
+            assert!(!dispatch_keyboard_event(&left_ctx, VK_RMENU, WM_KEYDOWN));
+            assert!(dispatch_keyboard_event(&left_ctx, VK_LMENU, WM_KEYDOWN));
+            assert!(dispatch_keyboard_event(&left_ctx, VK_LMENU, WM_KEYUP));
+            assert_eq!(
+                drain(&left_rx),
+                vec![HotkeyEvent::Pressed, HotkeyEvent::Released]
+            );
+
+            let right_option_shared = shared(HotkeyTrigger::RightOption);
+            let (right_option_ctx, right_option_rx) = callback_context(right_option_shared);
+            assert!(!dispatch_keyboard_event(
+                &right_option_ctx,
+                VK_LMENU,
+                WM_KEYDOWN
+            ));
+            assert!(dispatch_keyboard_event(
+                &right_option_ctx,
+                VK_RMENU,
+                WM_KEYDOWN
+            ));
+            assert_eq!(drain(&right_option_rx), vec![HotkeyEvent::Pressed]);
+
+            let right_alt_shared = shared(HotkeyTrigger::RightAlt);
+            let (right_alt_ctx, right_alt_rx) = callback_context(right_alt_shared);
+            assert!(!dispatch_keyboard_event(
+                &right_alt_ctx,
+                VK_LMENU,
+                WM_KEYDOWN
+            ));
+            assert!(dispatch_keyboard_event(
+                &right_alt_ctx,
+                VK_RMENU,
+                WM_KEYDOWN
+            ));
+            assert_eq!(drain(&right_alt_rx), vec![HotkeyEvent::Pressed]);
+        }
     }
 }
 
