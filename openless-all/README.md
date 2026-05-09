@@ -1,5 +1,11 @@
 # OpenLess All-Platform
 
+> **🇯🇵 これは katanumahotori によるフォーク版です（日本語ユーザー向け改造）。**
+> **使い方：[SETUP_JA.md](./SETUP_JA.md) を読んでください。** インストール、Groq API キー取得、推奨設定まで一通りカバーしています。
+>
+> 改造点：日本語フォント内蔵 / 辞書 → Whisper prompt 連携 / 全モード共通プロンプト / カスタム整文モード / アプリ別自動切替 / 翻訳ON-OFF / TSF 回避 / 漢字押し出し対策。
+> upstream（appergb/openless）への PR の一部はマージ済み、残りはレビュー待ち。
+
 This is the current cross-platform OpenLess workspace.
 
 ## App Directory
