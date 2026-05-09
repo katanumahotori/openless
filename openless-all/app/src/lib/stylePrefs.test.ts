@@ -21,6 +21,7 @@ const previousPrefs: UserPreferences = {
   activeAsrProvider: 'volcengine',
   activeLlmProvider: 'ark',
   restoreClipboardAfterPaste: true,
+  pasteShortcut: 'ctrlV',
   allowNonTsfInsertionFallback: true,
   customModes: [],
   appModeOverrides: [],

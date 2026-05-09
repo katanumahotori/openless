@@ -46,7 +46,7 @@ use crate::selection::{capture_selection, SelectionContext};
 use crate::types::{
     CapsulePayload, CapsuleState, ChineseScriptPreference, DictationSession, HotkeyCapability,
     HotkeyMode, HotkeyStatus, HotkeyStatusState, InsertStatus, OutputLanguagePreference,
-    PolishMode,
+    PasteShortcut, PolishMode,
 };
 #[cfg(target_os = "windows")]
 use crate::windows_ime_ipc::ImeSubmitTarget;
@@ -2858,6 +2858,7 @@ async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let prefs = inner.prefs.get();
     let restore_clipboard = prefs.restore_clipboard_after_paste;
     let allow_non_tsf_insertion_fallback = prefs.allow_non_tsf_insertion_fallback;
+    let paste_shortcut: PasteShortcut = prefs.paste_shortcut;
     let status = if focus_ready_for_paste {
         #[cfg(target_os = "windows")]
         {
@@ -2868,13 +2869,16 @@ async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                 &polished,
                 restore_clipboard,
                 allow_non_tsf_insertion_fallback,
+                paste_shortcut,
                 ime_target,
             )
             .await
         }
         #[cfg(not(target_os = "windows"))]
         {
-            inner.inserter.insert(&polished, restore_clipboard)
+            inner
+                .inserter
+                .insert(&polished, restore_clipboard, paste_shortcut)
         }
     } else {
         log::warn!(
@@ -3093,6 +3097,7 @@ async fn insert_with_windows_ime_first(
     polished: &str,
     restore_clipboard: bool,
     allow_non_tsf_insertion_fallback: bool,
+    paste_shortcut: PasteShortcut,
     ime_target: Option<ImeSubmitTarget>,
 ) -> InsertStatus {
     let prepared = {
@@ -3105,7 +3110,7 @@ async fn insert_with_windows_ime_first(
             allow_non_tsf_insertion_fallback,
             InsertStatus::Failed,
         ) {
-            return insert_via_non_tsf_fallback(inner, polished, restore_clipboard);
+            return insert_via_non_tsf_fallback(inner, polished, restore_clipboard, paste_shortcut);
         }
         log::warn!("[windows-ime] non-TSF insertion fallback is disabled; failing insert");
         return InsertStatus::Failed;
@@ -3130,7 +3135,7 @@ async fn insert_with_windows_ime_first(
     if ime_status == InsertStatus::Inserted {
         ime_status
     } else if should_try_non_tsf_insertion_fallback(allow_non_tsf_insertion_fallback, ime_status) {
-        insert_via_non_tsf_fallback(inner, polished, restore_clipboard)
+        insert_via_non_tsf_fallback(inner, polished, restore_clipboard, paste_shortcut)
     } else {
         log::warn!("[windows-ime] TSF did not insert; non-TSF insertion fallback is disabled");
         InsertStatus::Failed
@@ -3150,6 +3155,7 @@ fn insert_via_non_tsf_fallback(
     inner: &Arc<Inner>,
     polished: &str,
     restore_clipboard: bool,
+    paste_shortcut: PasteShortcut,
 ) -> InsertStatus {
     if inner.inserter.insert_via_unicode_keystrokes(polished) == InsertStatus::Inserted {
         log::info!("[windows-ime] TSF unavailable; inserted via Unicode SendInput");
@@ -3157,7 +3163,7 @@ fn insert_via_non_tsf_fallback(
     } else {
         inner
             .inserter
-            .insert_via_clipboard_fallback(polished, restore_clipboard)
+            .insert_via_clipboard_fallback(polished, restore_clipboard, paste_shortcut)
     }
 }
 

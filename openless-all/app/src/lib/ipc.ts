@@ -56,6 +56,7 @@ const mockSettings: UserPreferences = {
   activeAsrProvider: 'foundry-local-whisper',
   activeLlmProvider: 'ark',
   restoreClipboardAfterPaste: true,
+  pasteShortcut: 'ctrlV',
   allowNonTsfInsertionFallback: true,
   customModes: [],
   appModeOverrides: [],
