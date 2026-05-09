@@ -586,6 +586,7 @@ async fn validate_llm_provider() -> Result<(), String> {
             "验证连接",
             PolishMode::Raw,
             &[],
+            "",
             &[],
             ChineseScriptPreference::Auto,
             OutputLanguagePreference::Auto,
