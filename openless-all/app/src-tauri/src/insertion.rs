@@ -82,7 +82,10 @@ impl TextInserter {
         // so if we returned that as-is the caller would treat it as failure
         // and run the fallback path, double-pasting the text. Force
         // `Inserted` here to suppress the redundant fallback.
-        let _ = self.insert(text, true);
+        // PR #360 で paste shortcut が設定可能になったが、ATOK 干渉回避のための
+        // クリップボード経由フォールバックは Ctrl+V を前提に組まれているので
+        // ここは固定で Ctrl+V を使う（ユーザー設定の paste_shortcut とは独立）。
+        let _ = self.insert(text, true, crate::types::PasteShortcut::CtrlV);
         InsertStatus::Inserted
     }
 
