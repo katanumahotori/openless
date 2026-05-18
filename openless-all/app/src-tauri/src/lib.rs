@@ -37,7 +37,10 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-const LOG_ROTATE_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_ROTATE_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+/// 実行中ローテーションの確認間隔（秒）。tray 常駐で再起動されないまま
+/// 数週間走るケースに備える。
+const LOG_ROTATE_CHECK_INTERVAL_SECS: u64 = 1800;
 
 /// 第一次 show 时把 QA 浮窗摆到屏幕底部居中；之后的 show 不再 reposition，
 /// 让用户拖动后的位置在 hide → show 之间得以保持。详见 issue #118 v2。
@@ -662,8 +665,24 @@ fn init_file_logger() {
         loggers.push(WriteLogger::new(LevelFilter::Info, config, file));
     }
     let _ = CombinedLogger::init(loggers);
+
+    // 実行中の定期ローテーション。起動時 rotate だけだと tray 常駐で
+    // 再起動されないまま走り続けたときに肥大が止まらないため、30 分ごとに
+    // サイズを確認して超過していれば in-place で切り詰める。
+    std::thread::spawn(move || {
+        let log_file = log_dir_path().join("openless.log");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(
+                LOG_ROTATE_CHECK_INTERVAL_SECS,
+            ));
+            if let Err(e) = truncate_log_if_too_large(&log_file) {
+                eprintln!("[logger] WARN 实行中ローテーション失敗: {e}");
+            }
+        }
+    });
 }
 
+/// 起動時ローテーション：まだロガーがファイルを開いていないので rename できる。
 fn rotate_log_if_too_large(path: &std::path::Path) -> std::io::Result<()> {
     let Ok(metadata) = std::fs::metadata(path) else {
         return Ok(());
@@ -679,6 +698,28 @@ fn rotate_log_if_too_large(path: &std::path::Path) -> std::io::Result<()> {
         Err(e) => return Err(e),
     }
     std::fs::rename(path, archive)
+}
+
+/// 実行中ローテーション：ロガーがファイルを append で開いたままなので
+/// Windows では rename できない（共有モードに DELETE が無い）。代わりに
+/// 現ログを `openless.log.1` にコピーしてから本体を `set_len(0)` で
+/// 切り詰める。append ハンドルは次回書き込みで EOF=0 から再開するので
+/// 連続性は保たれる。コピーと truncate の間に書かれた数行は失われ得るが、
+/// 診断ログなので許容する。
+fn truncate_log_if_too_large(path: &std::path::Path) -> std::io::Result<()> {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if metadata.len() <= LOG_ROTATE_LIMIT_BYTES {
+        return Ok(());
+    }
+    let archive = path.with_file_name("openless.log.1");
+    // 直近ログを退避（コピー失敗してもローテーション自体は続行する）。
+    if let Err(e) = std::fs::copy(path, &archive) {
+        eprintln!("[logger] WARN ローテーション退避コピー失敗: {e}");
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(0)
 }
 
 pub fn log_dir_path() -> std::path::PathBuf {
