@@ -2972,7 +2972,7 @@ async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         state.phase = SessionPhase::Idle;
         state.focus_target = None;
     }
-    schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+    schedule_capsule_idle(inner, CAPSULE_DONE_HIDE_DELAY_MS);
 
     Ok(())
 }
@@ -3030,7 +3030,7 @@ fn cancel_session(inner: &Arc<Inner>) {
     }
     emit_capsule(inner, CapsuleState::Cancelled, 0.0, 0, None, None);
     log::info!("[coord] session cancelled (was {phase:?})");
-    schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+    schedule_capsule_idle(inner, CAPSULE_DONE_HIDE_DELAY_MS);
 }
 
 #[cfg(target_os = "windows")]
@@ -4597,9 +4597,13 @@ fn enabled_phrases(inner: &Arc<Inner>) -> Vec<String> {
         .collect()
 }
 
-/// 终止态（Done / Cancelled / Error）后延迟 N ms 把胶囊改回 Idle，让浮窗自动消失。
-/// 用户点 ✕ / ✓ / 中途出错 / 按 Esc 都走这里，统一 2 秒。
+/// エラー終止後に胶囊を Idle に戻して浮窗を消すまでの遅延（ms）。
+/// エラー文言はユーザーが読む時間が要るので長め。
 const CAPSULE_AUTO_HIDE_DELAY_MS: u64 = 2000;
+
+/// 正常終止（Done）/ キャンセル後の遅延（ms）。挿入は既に完了しているので
+/// 確認用の浮窗はすぐ消す。エラーと違い読む情報が無いため短くてよい。
+const CAPSULE_DONE_HIDE_DELAY_MS: u64 = 200;
 
 /// Coordinator 全局超时保护：防止 ASR await_final_result() 永远挂起。
 /// 设置为 15 秒（比 ASR 的 12 秒 FINAL_RESULT_TIMEOUT 稍长），
