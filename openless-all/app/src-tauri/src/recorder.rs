@@ -491,7 +491,11 @@ fn process_callback(
     if count == 1 || count % LOG_EVERY_N_CALLBACKS == 0 {
         let pk_in = state.peak_input_rms_milli.load(Ordering::Relaxed) as f32 / 1000.0;
         let pk_out = state.peak_output_rms_milli.load(Ordering::Relaxed) as f32 / 1000.0;
-        log::info!(
+        // 最初のコールバックだけ INFO（録音が始まりマイクが音を拾えているかの
+        // 確認に有用）。以降の周期ログは DEBUG に落とす：tray 常駐アプリで
+        // 毎秒数行の INFO はログを無駄に肥大させ、長時間セッションだと GB 級に
+        // なる。詳細診断が要るときだけ DEBUG を有効化すればよい。
+        let msg = format!(
             "[recorder] cb#{count} inLen={} outLen={} inRMS={:.5} outRMS={:.5} peakIn={:.5} peakOut={:.5}",
             mono.len(),
             resampled.len(),
@@ -500,6 +504,11 @@ fn process_callback(
             pk_in,
             pk_out
         );
+        if count == 1 {
+            log::info!("{msg}");
+        } else {
+            log::debug!("{msg}");
+        }
     }
 }
 

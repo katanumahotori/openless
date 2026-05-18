@@ -99,6 +99,22 @@ export function ShortcutRecorder({
     }
   };
 
+  // Modifier-only プリセット。Alt / Ctrl 単独キーは「録音」UI でのキャプチャが
+  // 不安定（Windows では Alt 押下でウィンドウメニューにフォーカスが奪われ、
+  // keyup が録音 div に届かず確定できないことがある）。クリック一発で確実に
+  // 設定できる経路を用意する。値は backend の legacy_modifier_trigger が
+  // 受理する primary 名（rightoption / leftoption / rightcontrol / leftcontrol）。
+  const modifierPresets: { primary: string; label: string }[] = [
+    { primary: 'RightOption', label: '右Alt' },
+    { primary: 'LeftOption', label: '左Alt' },
+    { primary: 'RightControl', label: '右Ctrl' },
+    { primary: 'LeftControl', label: '左Ctrl' },
+  ];
+  const pickPreset = (primary: string) => {
+    if (disabled) return;
+    void finish({ primary, modifiers: [] });
+  };
+
   const rootStyle: CSSProperties = {
     display: 'flex',
     flexDirection: 'column',
@@ -155,6 +171,34 @@ export function ShortcutRecorder({
         >
           {t('settings.recording.comboRecordHint')}
           <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', marginTop: 4 }}>Esc 取消</div>
+        </div>
+      )}
+      {!recording && !disabled && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+          <span style={{ fontSize: 11, color: 'var(--ol-ink-4)' }}>修飾キー単独：</span>
+          {modifierPresets.map(preset => (
+            <button
+              key={preset.primary}
+              type="button"
+              onClick={() => pickPreset(preset.primary)}
+              style={{
+                fontSize: 11,
+                padding: '3px 9px',
+                background: formatComboLabel(value) === formatComboLabel({ primary: preset.primary, modifiers: [] })
+                  ? 'var(--ol-blue)'
+                  : 'rgba(0,0,0,0.06)',
+                color: formatComboLabel(value) === formatComboLabel({ primary: preset.primary, modifiers: [] })
+                  ? '#fff'
+                  : 'var(--ol-ink-2)',
+                border: 0,
+                borderRadius: 999,
+                fontFamily: 'inherit',
+                cursor: 'pointer',
+              }}
+            >
+              {preset.label}
+            </button>
+          ))}
         </div>
       )}
       {error && <div style={{ fontSize: 11, color: 'var(--ol-red, #ef4444)' }}>{error}</div>}
