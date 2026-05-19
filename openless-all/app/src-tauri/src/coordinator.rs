@@ -3486,18 +3486,24 @@ fn classify_llm_error(e: &LLMError) -> LlmFailure {
 
 /// 整形/翻訳のフォールバック用モデルチェーンを組む。
 ///
-/// 先頭は必ずユーザーが設定したモデル。後続はプロバイダ既知の予備モデルを
-/// TPD（1日のトークン上限）が大きい順に並べる。メインが 429 になったとき
-/// 順に次へ切り替わる。Groq 無料枠のみ予備モデルが分かっているため、
-/// 他プロバイダでは `[primary]` のみ（＝従来どおり予備なし）。
+/// 先頭は必ずユーザーが設定したモデル。後続は Groq 無料枠の予備モデルを
+/// **整形品質の高い順**に並べる。メインが 429 になったとき順に次へ切り替わる。
+/// Groq 以外のプロバイダでは `[primary]` のみ（＝従来どおり予備なし）。
+///
+/// 順序の根拠：
+/// - `gpt-oss-20b` … 実績のある `gpt-oss-120b` と同系列。整形ルール（全角
+///   約物・余計な加筆をしない）の追従が近いと期待でき、最優先の予備。
+/// - `llama-3.3-70b-versatile` … 70B 汎用、非推論。指示追従が安定。
+/// - `qwen/qwen3-32b` … 推論モデル。句点を全角スペースに化けさせる・言って
+///   いない語を加筆する癖があり整形品質は劣る。ただし TPD が最大なので、
+///   他が全部枯れたときの最後の砦として必ず残す。
 fn build_model_chain(primary: &str, base_url: &str) -> Vec<String> {
     let mut chain = vec![primary.to_string()];
     if base_url.contains("groq.com") {
-        // TPD 降順: qwen3-32b(500K) > gpt-oss-120b(200K) > llama-3.3-70b(100K)
         for m in [
-            "qwen/qwen3-32b",
-            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
             "llama-3.3-70b-versatile",
+            "qwen/qwen3-32b",
         ] {
             if !chain.iter().any(|c| c == m) {
                 chain.push(m.to_string());
@@ -4470,29 +4476,32 @@ mod tests {
     }
 
     #[test]
-    fn build_model_chain_groq_appends_fallbacks_in_tpd_order() {
+    fn build_model_chain_groq_appends_quality_ordered_fallbacks() {
         let chain = build_model_chain("openai/gpt-oss-120b", "https://api.groq.com/openai/v1");
-        // 先頭は必ずユーザー設定のモデル。
-        assert_eq!(chain[0], "openai/gpt-oss-120b");
-        // 重複は除かれる（primary が gpt-oss-120b なので予備リストの同名は出ない）。
+        // 先頭はユーザー設定モデル、後続は整形品質の高い順。
         assert_eq!(
             chain,
             vec![
                 "openai/gpt-oss-120b".to_string(),
-                "qwen/qwen3-32b".to_string(),
+                "openai/gpt-oss-20b".to_string(),
                 "llama-3.3-70b-versatile".to_string(),
+                "qwen/qwen3-32b".to_string(),
             ]
         );
     }
 
     #[test]
-    fn build_model_chain_groq_keeps_unknown_primary_then_all_fallbacks() {
+    fn build_model_chain_groq_dedups_primary_from_spares() {
+        // primary が予備リストにも含まれる場合は重複排除される。
         let chain = build_model_chain("qwen/qwen3-32b", "https://api.groq.com/openai/v1");
         assert_eq!(chain[0], "qwen/qwen3-32b");
-        // qwen3-32b は予備リストにもあるので重複排除され、合計 3 件。
         assert_eq!(chain.len(), 3);
-        assert!(chain.contains(&"openai/gpt-oss-120b".to_string()));
+        assert!(chain.contains(&"openai/gpt-oss-20b".to_string()));
         assert!(chain.contains(&"llama-3.3-70b-versatile".to_string()));
+        assert_eq!(
+            chain.iter().filter(|m| m.as_str() == "qwen/qwen3-32b").count(),
+            1
+        );
     }
 
     #[test]
