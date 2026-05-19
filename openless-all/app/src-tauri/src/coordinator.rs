@@ -3464,16 +3464,22 @@ mod model_fallback {
 enum LlmFailure {
     /// 429: 1日のトークン上限超過。次モデルへ切替＋枯渇マーク。
     Quota,
-    /// 5xx / overload: 一時的な障害。次モデルを試すが枯渇マークはしない。
+    /// 5xx（過負荷）/ 400・404（モデル廃止・不明モデル）。次モデルを試すが
+    /// 枯渇マークはしない。Groq の Preview モデルが廃止されたケースもここで
+    /// 拾い、予備モデルへ逃がす。
     Transient,
-    /// 認証エラー・不正リクエスト等。別モデルを試しても無駄なので即返す。
+    /// 認証エラー（401/403）等。別モデルを試しても直らないので即返す。
     Fatal,
 }
 
 fn classify_llm_error(e: &LLMError) -> LlmFailure {
     match e {
         LLMError::InvalidResponse { status, .. } if *status == 429 => LlmFailure::Quota,
-        LLMError::InvalidResponse { status, .. } if *status >= 500 => LlmFailure::Transient,
+        LLMError::InvalidResponse { status, .. }
+            if *status >= 500 || *status == 400 || *status == 404 =>
+        {
+            LlmFailure::Transient
+        }
         _ => LlmFailure::Fatal,
     }
 }
@@ -4506,14 +4512,16 @@ mod tests {
         };
         assert!(matches!(classify_llm_error(&quota), LlmFailure::Quota));
 
-        let transient = LLMError::InvalidResponse {
-            status: 503,
-            body: String::new(),
-        };
-        assert!(matches!(
-            classify_llm_error(&transient),
-            LlmFailure::Transient
-        ));
+        for status in [500u16, 503, 400, 404] {
+            let transient = LLMError::InvalidResponse {
+                status,
+                body: String::new(),
+            };
+            assert!(
+                matches!(classify_llm_error(&transient), LlmFailure::Transient),
+                "status {status} should be Transient"
+            );
+        }
 
         let fatal = LLMError::InvalidResponse {
             status: 401,
