@@ -508,20 +508,28 @@ fn chat_completions_url(base_url: &str) -> String {
     format!("{}/chat/completions", without_trailing)
 }
 
-/// gpt-oss 系モデルのリクエストに `reasoning_effort: "low"` を付ける。
+/// 推論モデルのリクエストに `reasoning_effort` を付けて思考を抑える。
 ///
 /// 整形/翻訳は「決まったルールでテキストを直す」ほぼ機械的なタスクで、深い
-/// 推論は不要。gpt-oss は推論モデルで既定（medium）だと答える前に長く「考え」、
-/// レイテンシが 0.3〜4 秒とばらつく。`low` にすると：
-/// - 整形が速くなる（生成する推論トークンが減る）
-/// - 推論にトークンを使い切って最終回答（content）が空になる事故が減る
+/// 推論は不要。推論モデルは既定だと答える前に長く「考え」、レイテンシが
+/// 0.3〜4 秒とばらつき、推論にトークンを使い切って最終回答（content）が空に
+/// なる事故も起きる。思考を抑えると速く・安定し、空応答も減る。
 ///
-/// `reasoning_effort` は gpt-oss-20b / gpt-oss-120b 専用パラメータ。llama や
-/// qwen に送ると弾かれうるので、モデル名で gpt-oss を判定したときだけ付ける。
+/// モデル系列ごとに対応値が違う（Groq 仕様）：
+/// - gpt-oss（20b/120b）… `low`（最小値。`none` は非対応）
+/// - Qwen3 … `none`（thinking を完全オフにできる）
+/// - llama 等の非推論モデル … パラメータ自体を付けない（送ると弾かれうる）
 fn apply_reasoning_effort(body: &mut Value, model: &str) {
-    if model.contains("gpt-oss") {
+    let effort = if model.contains("gpt-oss") {
+        Some("low")
+    } else if model.contains("qwen3") || model.contains("qwen-3") {
+        Some("none")
+    } else {
+        None
+    };
+    if let Some(effort) = effort {
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("reasoning_effort".to_string(), json!("low"));
+            obj.insert("reasoning_effort".to_string(), json!(effort));
         }
     }
 }
@@ -730,6 +738,8 @@ fn is_japanese_char(c: char) -> bool {
 /// - 言葉の切れ目に紛れ込んだ半角スペースを除去（前後どちらかが日本語文字の
 ///   とき）。日本語文に語間スペースは無いため誤挿入とみなす。英単語間
 ///   （両側 ASCII）のスペースは残す。
+/// - 全角スペース `　` は **！？ の直後だけ** 残し、それ以外（句点・読点の
+///   後や語中）は除去する。規約上 全角スペースは ！？ の後のみ許可。
 fn normalize_japanese_punctuation(text: &str) -> String {
     // Pass 1: ASCII 約物 → 全角（直前が日本語文字のときだけ）
     let src: Vec<char> = text.chars().collect();
@@ -784,23 +794,24 @@ fn normalize_japanese_punctuation(text: &str) -> String {
         i += 1;
     }
 
-    // Pass 3: 言葉の切れ目に紛れ込んだ半角スペースを除去する。
-    // 半角スペースの前後どちらかが日本語文字なら誤挿入とみなして消す。
-    // 両側が ASCII のとき（英単語間）だけ残す。Pass 2 が入れた全角スペース
-    // `　` は半角ではないので対象外。
+    // Pass 3: 不要なスペースを除去する。
+    //  - 半角スペース ' ' … 前後どちらかが日本語文字なら誤挿入とみなし除去。
+    //    両側が ASCII（英単語間）のときだけ残す。
+    //  - 全角スペース '　' … 直前が ！？ のときだけ残す。句点・読点の直後や
+    //    語中など、それ以外に出た全角スペースはモデルの誤り（！？用ルールの
+    //    過剰適用）なので除去。Pass 2 が入れた ！？ 直後の `　` は残る。
     let chars: Vec<char> = p2.chars().collect();
     let mut out = String::with_capacity(p2.len());
     for (idx, &c) in chars.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|p| chars.get(p)).copied();
         if c == ' ' {
-            let prev_ja = idx
-                .checked_sub(1)
-                .and_then(|p| chars.get(p))
-                .map(|&p| is_japanese_char(p))
-                .unwrap_or(false);
+            let prev_ja = prev.map(is_japanese_char).unwrap_or(false);
             let next_ja = src_is_japanese_at(&chars, idx + 1);
             if prev_ja || next_ja {
                 continue; // 半角スペースを落とす
             }
+        } else if c == '\u{3000}' && !matches!(prev, Some('！') | Some('？')) {
+            continue; // ！？ 直後以外の全角スペースを落とす
         }
         out.push(c);
     }
@@ -1378,29 +1389,30 @@ mod tests {
     }
 
     #[test]
-    fn apply_reasoning_effort_only_for_gpt_oss() {
-        let mut gpt20 = json!({ "model": "openai/gpt-oss-20b" });
-        apply_reasoning_effort(&mut gpt20, "openai/gpt-oss-20b");
+    fn apply_reasoning_effort_per_model_family() {
+        // gpt-oss → low
+        for m in ["openai/gpt-oss-20b", "openai/gpt-oss-120b"] {
+            let mut body = json!({ "model": m });
+            apply_reasoning_effort(&mut body, m);
+            assert_eq!(
+                body.get("reasoning_effort").and_then(|v| v.as_str()),
+                Some("low"),
+                "{m} should get low"
+            );
+        }
+
+        // Qwen3 → none（thinking 完全オフ）
+        let mut qwen = json!({ "model": "qwen/qwen3-32b" });
+        apply_reasoning_effort(&mut qwen, "qwen/qwen3-32b");
         assert_eq!(
-            gpt20.get("reasoning_effort").and_then(|v| v.as_str()),
-            Some("low")
+            qwen.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("none")
         );
 
-        let mut gpt120 = json!({ "model": "openai/gpt-oss-120b" });
-        apply_reasoning_effort(&mut gpt120, "openai/gpt-oss-120b");
-        assert_eq!(
-            gpt120.get("reasoning_effort").and_then(|v| v.as_str()),
-            Some("low")
-        );
-
-        // gpt-oss 以外には付けない（非対応パラメータで弾かれるのを防ぐ）。
+        // 非推論モデルにはパラメータを付けない（送ると弾かれうる）。
         let mut llama = json!({ "model": "llama-3.3-70b-versatile" });
         apply_reasoning_effort(&mut llama, "llama-3.3-70b-versatile");
         assert!(llama.get("reasoning_effort").is_none());
-
-        let mut qwen = json!({ "model": "qwen/qwen3-32b" });
-        apply_reasoning_effort(&mut qwen, "qwen/qwen3-32b");
-        assert!(qwen.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -1701,6 +1713,29 @@ mod tests {
         assert_eq!(
             normalize_japanese_punctuation("this is a test"),
             "this is a test"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_strips_fullwidth_space_except_after_bang() {
+        // 句点の直後の全角スペースは除去（！？用ルールの過剰適用）。
+        assert_eq!(
+            normalize_japanese_punctuation("完了です。　次の話"),
+            "完了です。次の話"
+        );
+        // 読点の後・語中の全角スペースも除去。
+        assert_eq!(
+            normalize_japanese_punctuation("まず、　それから"),
+            "まず、それから"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("これは　テスト"),
+            "これはテスト"
+        );
+        // ！？ の直後の全角スペースは残す（規約どおり）。
+        assert_eq!(
+            normalize_japanese_punctuation("すごい！　本当に"),
+            "すごい！　本当に"
         );
     }
 
