@@ -3480,6 +3480,8 @@ fn classify_llm_error(e: &LLMError) -> LlmFailure {
         {
             LlmFailure::Transient
         }
+        // 整形結果が空。次モデルなら正しく返せる可能性があるので次へ。
+        LLMError::EmptyResponse => LlmFailure::Transient,
         _ => LlmFailure::Fatal,
     }
 }
@@ -4531,6 +4533,12 @@ mod tests {
                 "status {status} should be Transient"
             );
         }
+
+        // 整形結果が空 → 次モデルを試す（Transient）。
+        assert!(matches!(
+            classify_llm_error(&LLMError::EmptyResponse),
+            LlmFailure::Transient
+        ));
 
         let fatal = LLMError::InvalidResponse {
             status: 401,

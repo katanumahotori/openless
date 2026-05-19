@@ -65,6 +65,11 @@ pub enum LLMError {
     InvalidResponse { status: u16, body: String },
     #[error("parse error: {0}")]
     ParseError(String),
+    /// レスポンスは HTTP 200 だが、整形結果（content）が空。推論モデルが
+    /// 思考にトークンを使い切り最終回答を出さなかった等。フォールバック
+    /// （次モデル→生テキスト）の対象にするため独立した variant にする。
+    #[error("empty response content")]
+    EmptyResponse,
 }
 
 pub struct OpenAICompatibleLLMProvider {
@@ -627,12 +632,22 @@ fn extract_assistant_content(body: &str) -> Result<String, LLMError> {
     let first = choices
         .first()
         .ok_or_else(|| LLMError::ParseError("choices array is empty".into()))?;
+    // content が空文字 / null / 欠落のときは EmptyResponse として扱う。
+    // 推論モデル（gpt-oss 等）が思考チャネルにトークンを使い切り、最終回答
+    // チャネル（content）を空のまま返すことがある。ここを ParseError に
+    // すると整形が即失敗扱い（Fatal）になり、フォールバックも生テキスト
+    // 退避も働かず「テキストが丸ごと消える」。EmptyResponse なら呼び出し側
+    // が次モデル→生テキストへ退避できる。
     let content = first
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| LLMError::ParseError("message.content is not a string".into()))?;
-    Ok(clean_polish_output(content))
+        .unwrap_or("");
+    let cleaned = clean_polish_output(content);
+    if cleaned.trim().is_empty() {
+        return Err(LLMError::EmptyResponse);
+    }
+    Ok(cleaned)
 }
 
 /// Best-effort cleanup of common LLM "introduction" prefixes and markdown fences.
@@ -1301,6 +1316,44 @@ mod tests {
         assert!(
             s.contains("当前") && s.contains("最新"),
             "需要明确：只输出当前最新一条"
+        );
+    }
+
+    #[test]
+    fn extract_assistant_content_empty_content_is_empty_response_error() {
+        // 推論モデルが content を空で返す（思考だけして最終回答なし）ケース。
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning":"考え中..."}}]}"#;
+        assert!(matches!(
+            extract_assistant_content(body),
+            Err(LLMError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn extract_assistant_content_null_content_is_empty_response_error() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null}}]}"#;
+        assert!(matches!(
+            extract_assistant_content(body),
+            Err(LLMError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn extract_assistant_content_think_only_is_empty_response_error() {
+        // content が <think> ブロックだけ → 除去後に空 → EmptyResponse。
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"<think>分析のみ</think>"}}]}"#;
+        assert!(matches!(
+            extract_assistant_content(body),
+            Err(LLMError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn extract_assistant_content_normal_content_ok() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"これは整形済みの文章です。"}}]}"#;
+        assert_eq!(
+            extract_assistant_content(body).unwrap(),
+            "これは整形済みの文章です。"
         );
     }
 
