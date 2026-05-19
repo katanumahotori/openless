@@ -656,7 +656,86 @@ fn clean_polish_output(content: &str) -> String {
         }
     }
 
-    output.trim().to_string()
+    normalize_japanese_punctuation(output.trim())
+}
+
+/// 文字が「日本語の本文文字」かどうか。約物変換の文脈判定に使う。
+fn is_japanese_char(c: char) -> bool {
+    matches!(c,
+        // ひらがな + カタカナ
+        '\u{3040}'..='\u{30ff}'
+        // CJK統合漢字 + 拡張A
+        | '\u{3400}'..='\u{4dbf}'
+        | '\u{4e00}'..='\u{9fff}'
+        // 全角英数・記号（半角の対の全角形）
+        | '\u{ff00}'..='\u{ffef}'
+        // 長音符・全角スペース・代表的な全角約物
+        | '\u{30fc}' | '　' | '、' | '。' | '！' | '？'
+        | '「' | '」' | '『' | '』' | '（' | '）')
+}
+
+/// 日本語テキストの ASCII 約物を全角に決定論的に正規化する。
+///
+/// LLM へ「半角禁止・全角を使え」とプロンプトで指示しても遵守は不安定
+/// （特に長い custom prompt の末尾に足したルールは埋もれる）。半角→全角は
+/// 純粋に機械的な変換なので、LLM ではなくここで確実に行う。
+///
+/// 文脈依存：ASCII 約物の **直前が日本語文字** のときだけ変換する。これにより
+/// `3.14` `1,000` `example.com` `.json` `a.m.` 等の数字・英字・URL・コード・
+/// 英文は変換されない（直前が ASCII のため）。
+///
+/// 変換規則:
+/// - `.`→`。`  `,`→`、`  `!`→`！`  `?`→`？`（直前が日本語文字のときのみ）
+/// - `！`/`？` の直後：半角/全角スペースの連続を全角スペース `　` 1つに畳む。
+///   スペースが無ければ補う。ただし文末・改行直前・閉じ括弧や別の約物が
+///   続く場合は補わない。
+fn normalize_japanese_punctuation(text: &str) -> String {
+    // Pass 1: ASCII 約物 → 全角（直前が日本語文字のときだけ）
+    let mut p1 = String::with_capacity(text.len() + 16);
+    for c in text.chars() {
+        let prev_ja = p1.chars().last().map(is_japanese_char).unwrap_or(false);
+        match c {
+            '.' if prev_ja => p1.push('。'),
+            ',' if prev_ja => p1.push('、'),
+            '!' if prev_ja => p1.push('！'),
+            '?' if prev_ja => p1.push('？'),
+            other => p1.push(other),
+        }
+    }
+
+    // Pass 2: ！？ の直後のスペースを全角スペース1つに正規化
+    let chars: Vec<char> = p1.chars().collect();
+    let mut out = String::with_capacity(p1.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        out.push(c);
+        if c == '！' || c == '？' {
+            // 後続の空白（半角/全角/タブ）をまとめて読み飛ばす
+            let mut j = i + 1;
+            while j < chars.len() && matches!(chars[j], ' ' | '\u{3000}' | '\t') {
+                j += 1;
+            }
+            // 次の実文字が「文の続き」なら全角スペースを1つ入れる。
+            // 文末・改行・閉じ括弧・別の約物の前には入れない。
+            let needs_space = match chars.get(j) {
+                None => false,
+                Some(nx) => !matches!(
+                    nx,
+                    '\n' | '\r'
+                        | '」' | '』' | '）' | ')'
+                        | '！' | '？' | '。' | '、' | '!' | '?'
+                ),
+            };
+            if needs_space {
+                out.push('\u{3000}');
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Strip model reasoning blocks so only the final polished text is inserted.
@@ -1419,6 +1498,57 @@ mod tests {
         assert!(prompt.contains("ビックリマーク後に全角スペース"));
         // 終端側の余計な空白が残っていない（次の段落に影響しない）
         assert!(!prompt.ends_with("  "));
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_converts_after_japanese_chars() {
+        assert_eq!(
+            normalize_japanese_punctuation("これはすごい.やったね"),
+            "これはすごい。やったね"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("そうだね,たぶん"),
+            "そうだね、たぶん"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("Pythonを使う."),
+            "Pythonを使う。"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_protects_ascii_context() {
+        // 数字・URL・英文の ASCII 約物は直前が ASCII なので変換しない。
+        assert_eq!(normalize_japanese_punctuation("3.14"), "3.14");
+        assert_eq!(normalize_japanese_punctuation("1,000円"), "1,000円");
+        assert_eq!(
+            normalize_japanese_punctuation("see example.com for docs"),
+            "see example.com for docs"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("config.json を読む"),
+            "config.json を読む"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_fullwidth_space_after_bang() {
+        // ！？の直後：スペース無し → 補う / 半角スペース → 全角に畳む
+        assert_eq!(
+            normalize_japanese_punctuation("すごい!本当に?やった"),
+            "すごい！　本当に？　やった"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("やった! すごい"),
+            "やった！　すごい"
+        );
+        // 文末の ！ には trailing スペースを付けない
+        assert_eq!(normalize_japanese_punctuation("やったね!"), "やったね！");
+        // 閉じ括弧の前にはスペースを入れない
+        assert_eq!(
+            normalize_japanese_punctuation("「すごい!」と言った"),
+            "「すごい！」と言った"
+        );
     }
 
     #[test]
