@@ -127,6 +127,8 @@ impl WhisperBatchASR {
 
         let json: serde_json::Value = resp.json().await.context("parse Whisper response")?;
         let text = extract_confident_text(&json);
+        // 辞書プロンプトの echo（ユーザーが言っていない辞書語の羅列）を除去。
+        let text = strip_prompt_echo(&text, self.prompt.as_deref());
 
         Ok(RawTranscript { text, duration_ms })
     }
@@ -210,6 +212,95 @@ fn extract_confident_text(json: &serde_json::Value) -> String {
     kept
 }
 
+/// 2 つの文字列の最長共通部分文字列を返す `(a 内開始位置, 長さ)`。
+/// 長さ 0 のときは `(0, 0)`。
+fn longest_common_substring(a: &[char], b: &[char]) -> (usize, usize) {
+    if a.is_empty() || b.is_empty() {
+        return (0, 0);
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut best_len = 0usize;
+    let mut best_end_in_a = 0usize;
+    for i in 1..=a.len() {
+        let mut curr = vec![0usize; b.len() + 1];
+        for j in 1..=b.len() {
+            if a[i - 1] == b[j - 1] {
+                curr[j] = prev[j - 1] + 1;
+                if curr[j] > best_len {
+                    best_len = curr[j];
+                    best_end_in_a = i;
+                }
+            }
+        }
+        prev = curr;
+    }
+    (best_end_in_a - best_len, best_len)
+}
+
+/// Whisper が `prompt`（辞書語の `", "` 連結）を出力に echo（漏出）させた
+/// 断片を取り除く。
+///
+/// Whisper には prompt の内容を書き起こしに紛れ込ませる既知の欠陥があり、
+/// ユーザーが言っていない辞書語が「片沼ほとり, ADOS,」のようにカンマ込みで
+/// 出力されることがある。prompt は既知文字列なので、出力と prompt の最長共通
+/// 部分文字列を取り、それが **カンマ様の区切りを含む**（＝辞書語の羅列）なら
+/// echo とみなして除去する。カンマを含まない＝単独語の一致は、ユーザーが実際に
+/// その語を言った正当なケースと区別できないため除去しない。
+fn strip_prompt_echo(text: &str, prompt: Option<&str>) -> String {
+    let Some(prompt) = prompt else {
+        return text.to_string();
+    };
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return text.to_string();
+    }
+    let prompt_chars: Vec<char> = prompt.chars().collect();
+    let mut text_chars: Vec<char> = text.chars().collect();
+
+    const MIN_ECHO_LEN: usize = 5;
+    let is_comma = |c: char| matches!(c, ',' | '，' | '、');
+    let is_sep = |c: char| c.is_whitespace() || is_comma(c);
+
+    // 複数の echo 断片がありうるので、見つからなくなるまで繰り返す。
+    loop {
+        let (start, len) = longest_common_substring(&text_chars, &prompt_chars);
+        if len < MIN_ECHO_LEN {
+            break;
+        }
+        let frag = &text_chars[start..start + len];
+        if !frag.iter().copied().any(is_comma) {
+            // カンマを含まない一致は単独語。正当な発話の可能性があり除去しない。
+            break;
+        }
+        log::warn!(
+            "[whisper] prompt echo を除去: {:?}",
+            frag.iter().collect::<String>()
+        );
+        text_chars.drain(start..start + len);
+
+        // 除去で区切りが二重化したときだけ畳む：除去点の前後がどちらも
+        // 区切り（カンマ/空白）なら、後ろ側の区切り連続を削って 1 つにする。
+        // 片側だけが区切りの場合はユーザーが実際に打った句読点なので残す。
+        let head_sep = start > 0 && is_sep(text_chars[start - 1]);
+        let tail_sep = start < text_chars.len() && is_sep(text_chars[start]);
+        if head_sep && tail_sep {
+            while start < text_chars.len() && is_sep(text_chars[start]) {
+                text_chars.remove(start);
+            }
+        }
+    }
+
+    // 先頭・末尾に残った区切りを除去（echo が文頭/文末にあった場合）。
+    let mut result: Vec<char> = text_chars;
+    while result.first().is_some_and(|&c| is_sep(c)) {
+        result.remove(0);
+    }
+    while result.last().is_some_and(|&c| is_sep(c)) {
+        result.pop();
+    }
+    result.iter().collect()
+}
+
 /// 用户辞書の有効フレーズから Whisper の `prompt` パラメータを組み立てる。
 ///
 /// Whisper は `prompt` で語彙ヒント / スタイル文脈を渡せる：固有名詞・専門
@@ -265,6 +356,42 @@ pub fn build_prompt_from_phrases(phrases: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_prompt_echo_removes_comma_joined_dictionary_run() {
+        let prompt = "梁山泊, 片沼ほとり, ADOS, TRC.";
+        // 文中に prompt の断片が echo された
+        let text = "逆に言うと、片沼ほとり, ADOS, をこっちに移す";
+        let out = strip_prompt_echo(text, Some(prompt));
+        assert!(!out.contains("ADOS"), "echo が残っている: {out}");
+        assert!(out.contains("逆に言うと"));
+        assert!(out.contains("こっちに移す"));
+    }
+
+    #[test]
+    fn strip_prompt_echo_at_start_trims_leading_separators() {
+        let prompt = "梁山泊, 片沼ほとり, TRC.";
+        let text = "梁山泊, 片沼ほとり, 実際に話した内容";
+        let out = strip_prompt_echo(text, Some(prompt));
+        assert_eq!(out, "実際に話した内容");
+    }
+
+    #[test]
+    fn strip_prompt_echo_keeps_legit_single_word() {
+        // カンマを含まない単独一致は、ユーザーが実際にその語を言った可能性が
+        // あるので除去しない。
+        let prompt = "梁山泊, 片沼ほとり, TRC.";
+        let text = "梁山泊について話します";
+        assert_eq!(
+            strip_prompt_echo(text, Some(prompt)),
+            "梁山泊について話します"
+        );
+    }
+
+    #[test]
+    fn strip_prompt_echo_no_prompt_is_noop() {
+        assert_eq!(strip_prompt_echo("普通の文章です", None), "普通の文章です");
+    }
 
     #[test]
     fn build_prompt_returns_none_for_empty_input() {
