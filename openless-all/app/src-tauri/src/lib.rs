@@ -50,7 +50,10 @@ use tauri::menu::{
     CheckMenuItemBuilder, Menu, MenuBuilder, MenuItemBuilder, Submenu, SubmenuBuilder,
 };
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, Runtime};
+use tauri::{
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, PhysicalPosition, PhysicalSize,
+    RunEvent, Runtime,
+};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1038,15 +1041,92 @@ fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R
 
 /// 把 capsule 窗口移到屏幕底部居中，与 Swift `CapsuleWindowController.repositionToBottomCenter` 同效。
 /// 留 80pt 给 macOS Dock；Windows 任务栏一般在底部 48pt 以内，整体也合适。
+/// 入力先モニタの物理矩形（仮想デスクトップ座標）+ DPI スケール。
+#[cfg(target_os = "windows")]
+struct ForegroundMonitor {
+    /// モニタ全体の矩形（physical px、virtual-desktop 座標）。
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+    /// このモニタの実効 DPI スケール（1.0 = 96dpi）。
+    scale: f64,
+}
+
+/// 現在フォアグラウンドのウィンドウ（＝ユーザーが入力しているアプリ）が
+/// 載っているモニタを Win32 で特定する。マルチモニタで、カプセルを
+/// 「入力中の画面」に出すために使う。`window.current_monitor()` は
+/// カプセル自身のいるモニタを返してしまうため使えない。
+#[cfg(target_os = "windows")]
+fn foreground_window_monitor() -> Option<ForegroundMonitor> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let hmon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if hmon.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            return None;
+        }
+        let mut dpi_x: u32 = 96;
+        let mut dpi_y: u32 = 96;
+        // 失敗しても 96dpi 既定にフォールバックして続行。
+        let _ = GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        Some(ForegroundMonitor {
+            left: mi.rcMonitor.left,
+            top: mi.rcMonitor.top,
+            right: mi.rcMonitor.right,
+            bottom: mi.rcMonitor.bottom,
+            scale: (dpi_x as f64 / 96.0).max(0.1),
+        })
+    }
+}
+
 pub(crate) fn position_capsule_bottom_center<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     translation_active: bool,
 ) -> tauri::Result<()> {
+    let bounds = capsule_window_bounds(translation_active);
+
+    // Windows: 入力中アプリのモニタに合わせて配置する。マルチモニタで
+    // カプセルが中央画面に固定されないようにするための分岐。
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(mon) = foreground_window_monitor() {
+            let scale = mon.scale;
+            let phys_w = (bounds.width * scale).round() as i32;
+            let phys_h = (bounds.height * scale).round() as i32;
+            window.set_size(PhysicalSize::new(
+                phys_w.max(1) as u32,
+                phys_h.max(1) as u32,
+            ))?;
+
+            let mon_w = mon.right - mon.left;
+            let x = mon.left + ((mon_w - phys_w) / 2).max(0);
+            // 既存挙動と同じ「下端から visual高さ + 80 + inset」を physical px で。
+            let offset_from_bottom =
+                (capsule_visual_height(translation_active) + 80.0 + bounds.bottom_inset) * scale;
+            let y = ((mon.bottom as f64) - offset_from_bottom).round() as i32;
+            window.set_position(PhysicalPosition::new(x, y.max(mon.top)))?;
+            return Ok(());
+        }
+        // Win32 取得に失敗したときだけ下の current_monitor フォールバックへ。
+    }
+
     let monitor = match window.current_monitor()? {
         Some(m) => m,
         None => return Ok(()),
     };
-    let bounds = capsule_window_bounds(translation_active);
     window.set_size(LogicalSize::new(bounds.width, bounds.height))?;
 
     let scale = monitor.scale_factor();
