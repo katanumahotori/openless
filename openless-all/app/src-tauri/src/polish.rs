@@ -217,12 +217,13 @@ impl OpenAICompatibleLLMProvider {
     ) -> Result<String, LLMError> {
         let url = chat_completions_url(&self.config.base_url);
         let messages = build_polish_history_messages(system_prompt, prior_turns, user_prompt);
-        let body = json!({
+        let mut body = json!({
             "model": self.config.model,
             "stream": false,
             "temperature": self.config.temperature,
             "messages": messages,
         });
+        apply_reasoning_effort(&mut body, &self.config.model);
 
         log::info!(
             "[llm] POST {} provider={} model={} prior_turns={}",
@@ -242,7 +243,7 @@ impl OpenAICompatibleLLMProvider {
         user_prompt: &str,
     ) -> Result<String, LLMError> {
         let url = chat_completions_url(&self.config.base_url);
-        let body = json!({
+        let mut body = json!({
             "model": self.config.model,
             "stream": false,
             "temperature": self.config.temperature,
@@ -251,6 +252,7 @@ impl OpenAICompatibleLLMProvider {
                 { "role": "user", "content": user_prompt },
             ],
         });
+        apply_reasoning_effort(&mut body, &self.config.model);
 
         log::info!(
             "[llm] POST {} provider={} model={}",
@@ -504,6 +506,24 @@ fn chat_completions_url(base_url: &str) -> String {
     }
     let without_trailing = trimmed.strip_suffix('/').unwrap_or(trimmed);
     format!("{}/chat/completions", without_trailing)
+}
+
+/// gpt-oss 系モデルのリクエストに `reasoning_effort: "low"` を付ける。
+///
+/// 整形/翻訳は「決まったルールでテキストを直す」ほぼ機械的なタスクで、深い
+/// 推論は不要。gpt-oss は推論モデルで既定（medium）だと答える前に長く「考え」、
+/// レイテンシが 0.3〜4 秒とばらつく。`low` にすると：
+/// - 整形が速くなる（生成する推論トークンが減る）
+/// - 推論にトークンを使い切って最終回答（content）が空になる事故が減る
+///
+/// `reasoning_effort` は gpt-oss-20b / gpt-oss-120b 専用パラメータ。llama や
+/// qwen に送ると弾かれうるので、モデル名で gpt-oss を判定したときだけ付ける。
+fn apply_reasoning_effort(body: &mut Value, model: &str) {
+    if model.contains("gpt-oss") {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("reasoning_effort".to_string(), json!("low"));
+        }
+    }
 }
 
 /// 把 working_languages + front_app 拼成 system prompt 头部前提：
@@ -1355,6 +1375,32 @@ mod tests {
             extract_assistant_content(body).unwrap(),
             "これは整形済みの文章です。"
         );
+    }
+
+    #[test]
+    fn apply_reasoning_effort_only_for_gpt_oss() {
+        let mut gpt20 = json!({ "model": "openai/gpt-oss-20b" });
+        apply_reasoning_effort(&mut gpt20, "openai/gpt-oss-20b");
+        assert_eq!(
+            gpt20.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("low")
+        );
+
+        let mut gpt120 = json!({ "model": "openai/gpt-oss-120b" });
+        apply_reasoning_effort(&mut gpt120, "openai/gpt-oss-120b");
+        assert_eq!(
+            gpt120.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("low")
+        );
+
+        // gpt-oss 以外には付けない（非対応パラメータで弾かれるのを防ぐ）。
+        let mut llama = json!({ "model": "llama-3.3-70b-versatile" });
+        apply_reasoning_effort(&mut llama, "llama-3.3-70b-versatile");
+        assert!(llama.get("reasoning_effort").is_none());
+
+        let mut qwen = json!({ "model": "qwen/qwen3-32b" });
+        apply_reasoning_effort(&mut qwen, "qwen/qwen3-32b");
+        assert!(qwen.get("reasoning_effort").is_none());
     }
 
     #[test]
