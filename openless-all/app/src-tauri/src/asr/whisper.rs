@@ -91,7 +91,14 @@ impl WhisperBatchASR {
             .context("set MIME type")?;
         let mut form = reqwest::multipart::Form::new()
             .part("file", wav_part)
-            .text("model", self.model.clone());
+            .text("model", self.model.clone())
+            // verbose_json でセグメント単位のメタデータ（no_speech_prob /
+            // avg_logprob / compression_ratio）を取得する。これを使って
+            // Whisper の幻聴（無音・ノイズ区間での作話）セグメントを捨てる。
+            .text("response_format", "verbose_json")
+            // 文字起こしは決定論的タスク。temperature を明示 0 にして
+            // ランダムな作話の余地を減らす。
+            .text("temperature", "0");
 
         // `prompt` は空文字を送らない：OpenAI 互換実装によっては空文字でエラーに
         // なるリスクがある（Groq は許容するが防御的にスキップ）。`trim()` で
@@ -119,7 +126,7 @@ impl WhisperBatchASR {
         }
 
         let json: serde_json::Value = resp.json().await.context("parse Whisper response")?;
-        let text = json["text"].as_str().unwrap_or("").trim().to_string();
+        let text = extract_confident_text(&json);
 
         Ok(RawTranscript { text, duration_ms })
     }
@@ -133,6 +140,74 @@ impl crate::recorder::AudioConsumer for WhisperBatchASR {
     fn consume_pcm_chunk(&self, pcm: &[u8]) {
         self.buffer.lock().extend_from_slice(pcm);
     }
+}
+
+/// verbose_json レスポンスから、幻聴と思われるセグメントを除いた本文を組む。
+///
+/// Whisper は無音・小音・ノイズ区間で「もっともらしいが言っていない」テキストを
+/// 生成する既知の欠陥（hallucination）がある。録音の前後の沈黙やマイクのノイズが
+/// 無関係な単語に化けるのがこれ。verbose_json の各セグメントが持つ
+/// `no_speech_prob` / `avg_logprob` / `compression_ratio` を見て、明らかに
+/// 発話でないセグメントを捨てる。
+///
+/// 判定（いずれかに該当したら捨てる）:
+/// - `no_speech_prob > 0.6` かつ `avg_logprob < -0.5`
+///   → 無音確率が高く信頼度も低い。沈黙を作話したセグメント。
+/// - `compression_ratio > 2.4`
+///   → 同一フレーズの反復幻聴（Whisper 標準の閾値）。
+/// - `avg_logprob < -1.0`
+///   → 信頼度が極端に低い。ノイズを単語化したセグメント。
+///
+/// 実発話を誤って捨てるのが最悪なので、閾値は保守的に設定している。
+/// `segments` が無いレスポンスでは従来どおり `text` をそのまま使う。
+fn extract_confident_text(json: &serde_json::Value) -> String {
+    let Some(segments) = json.get("segments").and_then(|s| s.as_array()) else {
+        return json["text"].as_str().unwrap_or("").trim().to_string();
+    };
+
+    let mut kept = String::new();
+    for seg in segments {
+        let text = seg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        if text.trim().is_empty() {
+            continue;
+        }
+        let no_speech = seg
+            .get("no_speech_prob")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let avg_logprob = seg
+            .get("avg_logprob")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let compression = seg
+            .get("compression_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        let is_hallucination = (no_speech > 0.6 && avg_logprob < -0.5)
+            || compression > 2.4
+            || avg_logprob < -1.0;
+        if is_hallucination {
+            log::warn!(
+                "[whisper] 幻聴セグメントを除外: no_speech={:.2} avg_logprob={:.2} compression={:.2} text={:?}",
+                no_speech,
+                avg_logprob,
+                compression,
+                text.trim()
+            );
+            continue;
+        }
+        kept.push_str(text);
+    }
+
+    let kept = kept.trim().to_string();
+    if kept.is_empty() {
+        // 全セグメントが除外された（＝ほぼ無音録音）。フォールバックで
+        // 生 text を返すと幻聴を拾い直すので、空のまま返す。上位は空転写を
+        // 「何も話していない」として無害に扱う。
+        return String::new();
+    }
+    kept
 }
 
 /// 用户辞書の有効フレーズから Whisper の `prompt` パラメータを組み立てる。
