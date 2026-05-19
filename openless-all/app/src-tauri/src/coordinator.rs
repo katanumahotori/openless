@@ -5273,21 +5273,53 @@ struct CapsuleLayoutState {
     scale_bits: u64,
 }
 
-fn maybe_position_capsule_bottom_center<R: tauri::Runtime>(
-    inner: &Arc<Inner>,
+/// カプセルを配置すべきモニタの識別情報を返す。
+///
+/// `position_capsule_bottom_center` が実際に配置先を決めるのと **同じモニタ**
+/// を見る：Windows は入力中アプリの載るモニタ、その他は カプセル自身のモニタ。
+/// 再配置スキップ判定（`maybe_position_capsule_bottom_center`）のキャッシュ
+/// キーに使うため、ここがズレると「入力先が別画面に移ったのに再配置されない」
+/// バグになる。
+fn capsule_layout_snapshot<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     translation_active: bool,
-) {
-    let Some(monitor) = window.current_monitor().ok().flatten() else {
-        return;
-    };
-    let next = CapsuleLayoutState {
+) -> Option<CapsuleLayoutState> {
+    // Windows: 入力中アプリの載るモニタを基準にする。カプセル自身の
+    // current_monitor を使うと、入力先が別画面に移ってもカプセルはまだ元の
+    // 画面にいる → 「変化なし」と誤判定して再配置がスキップされる。
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(mon) = crate::foreground_window_monitor() {
+            return Some(CapsuleLayoutState {
+                translation_active,
+                monitor_x: mon.left,
+                monitor_y: mon.top,
+                monitor_width: (mon.right - mon.left).max(0) as u32,
+                monitor_height: (mon.bottom - mon.top).max(0) as u32,
+                scale_bits: mon.scale.to_bits(),
+            });
+        }
+        // Win32 取得失敗時のみ下の current_monitor フォールバックへ。
+        // position_capsule_bottom_center 側のフォールバックと一致させる。
+    }
+    let monitor = window.current_monitor().ok().flatten()?;
+    Some(CapsuleLayoutState {
         translation_active,
         monitor_x: monitor.position().x,
         monitor_y: monitor.position().y,
         monitor_width: monitor.size().width,
         monitor_height: monitor.size().height,
         scale_bits: monitor.scale_factor().to_bits(),
+    })
+}
+
+fn maybe_position_capsule_bottom_center<R: tauri::Runtime>(
+    inner: &Arc<Inner>,
+    window: &tauri::WebviewWindow<R>,
+    translation_active: bool,
+) {
+    let Some(next) = capsule_layout_snapshot(window, translation_active) else {
+        return;
     };
     {
         let last = inner.capsule_layout.lock();

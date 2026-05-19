@@ -1043,14 +1043,14 @@ fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R
 /// 留 80pt 给 macOS Dock；Windows 任务栏一般在底部 48pt 以内，整体也合适。
 /// 入力先モニタの物理矩形（仮想デスクトップ座標）+ DPI スケール。
 #[cfg(target_os = "windows")]
-struct ForegroundMonitor {
+pub(crate) struct ForegroundMonitor {
     /// モニタ全体の矩形（physical px、virtual-desktop 座標）。
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
+    pub(crate) left: i32,
+    pub(crate) top: i32,
+    pub(crate) right: i32,
+    pub(crate) bottom: i32,
     /// このモニタの実効 DPI スケール（1.0 = 96dpi）。
-    scale: f64,
+    pub(crate) scale: f64,
 }
 
 /// 現在フォアグラウンドのウィンドウ（＝ユーザーが入力しているアプリ）が
@@ -1058,7 +1058,7 @@ struct ForegroundMonitor {
 /// 「入力中の画面」に出すために使う。`window.current_monitor()` は
 /// カプセル自身のいるモニタを返してしまうため使えない。
 #[cfg(target_os = "windows")]
-fn foreground_window_monitor() -> Option<ForegroundMonitor> {
+pub(crate) fn foreground_window_monitor() -> Option<ForegroundMonitor> {
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
