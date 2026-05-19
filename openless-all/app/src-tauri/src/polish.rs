@@ -682,21 +682,34 @@ fn is_japanese_char(c: char) -> bool {
 ///
 /// 文脈依存：ASCII 約物の **直前が日本語文字** のときだけ変換する。これにより
 /// `3.14` `1,000` `example.com` `.json` `a.m.` 等の数字・英字・URL・コード・
-/// 英文は変換されない（直前が ASCII のため）。
+/// 英文は変換されない（直前が ASCII のため）。さらに `.` `,` は **直後が
+/// ASCII 英数字** のとき変換しない：`進捗.md` のようなファイル拡張子・小数・
+/// 桁区切りの区切り文字を句読点に化けさせないため。
 ///
 /// 変換規則:
-/// - `.`→`。`  `,`→`、`  `!`→`！`  `?`→`？`（直前が日本語文字のときのみ）
+/// - `.`→`。`  `,`→`、`（直前が日本語文字 かつ 直後が ASCII 英数字でないとき）
+/// - `!`→`！`  `?`→`？`（直前が日本語文字のときのみ）
 /// - `！`/`？` の直後：半角/全角スペースの連続を全角スペース `　` 1つに畳む。
 ///   スペースが無ければ補う。ただし文末・改行直前・閉じ括弧や別の約物が
 ///   続く場合は補わない。
+/// - 言葉の切れ目に紛れ込んだ半角スペースを除去（前後どちらかが日本語文字の
+///   とき）。日本語文に語間スペースは無いため誤挿入とみなす。英単語間
+///   （両側 ASCII）のスペースは残す。
 fn normalize_japanese_punctuation(text: &str) -> String {
     // Pass 1: ASCII 約物 → 全角（直前が日本語文字のときだけ）
+    let src: Vec<char> = text.chars().collect();
     let mut p1 = String::with_capacity(text.len() + 16);
-    for c in text.chars() {
+    for (idx, &c) in src.iter().enumerate() {
         let prev_ja = p1.chars().last().map(is_japanese_char).unwrap_or(false);
+        // 直後が ASCII 英数字なら、拡張子(.md) / 小数(3.14) / 桁区切り(1,000)
+        // 等の一部とみなし、`.` `,` は句読点に変換しない。
+        let next_ascii_alnum = src
+            .get(idx + 1)
+            .map(|n| n.is_ascii_alphanumeric())
+            .unwrap_or(false);
         match c {
-            '.' if prev_ja => p1.push('。'),
-            ',' if prev_ja => p1.push('、'),
+            '.' if prev_ja && !next_ascii_alnum => p1.push('。'),
+            ',' if prev_ja && !next_ascii_alnum => p1.push('、'),
             '!' if prev_ja => p1.push('！'),
             '?' if prev_ja => p1.push('？'),
             other => p1.push(other),
@@ -705,11 +718,11 @@ fn normalize_japanese_punctuation(text: &str) -> String {
 
     // Pass 2: ！？ の直後のスペースを全角スペース1つに正規化
     let chars: Vec<char> = p1.chars().collect();
-    let mut out = String::with_capacity(p1.len() + 16);
+    let mut p2 = String::with_capacity(p1.len() + 16);
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
-        out.push(c);
+        p2.push(c);
         if c == '！' || c == '？' {
             // 後続の空白（半角/全角/タブ）をまとめて読み飛ばす
             let mut j = i + 1;
@@ -728,14 +741,40 @@ fn normalize_japanese_punctuation(text: &str) -> String {
                 ),
             };
             if needs_space {
-                out.push('\u{3000}');
+                p2.push('\u{3000}');
             }
             i = j;
             continue;
         }
         i += 1;
     }
+
+    // Pass 3: 言葉の切れ目に紛れ込んだ半角スペースを除去する。
+    // 半角スペースの前後どちらかが日本語文字なら誤挿入とみなして消す。
+    // 両側が ASCII のとき（英単語間）だけ残す。Pass 2 が入れた全角スペース
+    // `　` は半角ではないので対象外。
+    let chars: Vec<char> = p2.chars().collect();
+    let mut out = String::with_capacity(p2.len());
+    for (idx, &c) in chars.iter().enumerate() {
+        if c == ' ' {
+            let prev_ja = idx
+                .checked_sub(1)
+                .and_then(|p| chars.get(p))
+                .map(|&p| is_japanese_char(p))
+                .unwrap_or(false);
+            let next_ja = src_is_japanese_at(&chars, idx + 1);
+            if prev_ja || next_ja {
+                continue; // 半角スペースを落とす
+            }
+        }
+        out.push(c);
+    }
     out
+}
+
+/// `chars[idx]` が存在し、日本語文字なら true。
+fn src_is_japanese_at(chars: &[char], idx: usize) -> bool {
+    chars.get(idx).map(|&c| is_japanese_char(c)).unwrap_or(false)
 }
 
 /// Strip model reasoning blocks so only the final polished text is inserted.
@@ -1525,9 +1564,44 @@ mod tests {
             normalize_japanese_punctuation("see example.com for docs"),
             "see example.com for docs"
         );
+        // 直前が日本語でも、直後が ASCII 英数字なら拡張子等とみなし変換しない。
+        // （空白は Pass 3 で除去されるので "config.jsonを読む" になる）
         assert_eq!(
             normalize_japanese_punctuation("config.json を読む"),
-            "config.json を読む"
+            "config.jsonを読む"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_keeps_file_extension_dot() {
+        // `進捗.md` の `.` は直後が英字なので句点に化けさせない。
+        assert_eq!(normalize_japanese_punctuation("進捗.md"), "進捗.md");
+        assert_eq!(
+            normalize_japanese_punctuation("進捗.md ですよ"),
+            "進捗.mdですよ"
+        );
+        // 文末の `.`（直後に英数字なし）は従来どおり句点に変換。
+        assert_eq!(
+            normalize_japanese_punctuation("これで完了です."),
+            "これで完了です。"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_strips_stray_halfwidth_space() {
+        // 前後どちらかが日本語文字の半角スペースは誤挿入として除去。
+        assert_eq!(
+            normalize_japanese_punctuation("入ってるね。 今使ってる"),
+            "入ってるね。今使ってる"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("拡張機を 拡張紙を"),
+            "拡張機を拡張紙を"
+        );
+        // 英単語間（両側 ASCII）の半角スペースは残す。
+        assert_eq!(
+            normalize_japanese_punctuation("this is a test"),
+            "this is a test"
         );
     }
 
