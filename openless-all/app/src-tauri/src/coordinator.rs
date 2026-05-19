@@ -3030,7 +3030,7 @@ fn cancel_session(inner: &Arc<Inner>) {
     }
     emit_capsule(inner, CapsuleState::Cancelled, 0.0, 0, None, None);
     log::info!("[coord] session cancelled (was {phase:?})");
-    schedule_capsule_idle(inner, CAPSULE_DONE_HIDE_DELAY_MS);
+    schedule_capsule_idle(inner, CAPSULE_CANCEL_HIDE_DELAY_MS);
 }
 
 #[cfg(target_os = "windows")]
@@ -4860,9 +4860,13 @@ fn enabled_phrases(inner: &Arc<Inner>) -> Vec<String> {
 /// エラー文言はユーザーが読む時間が要るので長め。
 const CAPSULE_AUTO_HIDE_DELAY_MS: u64 = 2000;
 
-/// 正常終止（Done）/ キャンセル後の遅延（ms）。挿入は既に完了しているので
-/// 確認用の浮窗はすぐ消す。エラーと違い読む情報が無いため短くてよい。
+/// 正常終止（Done）後の遅延（ms）。挿入は既に完了しているので確認用の浮窗は
+/// すぐ消す。エラーと違い読む情報が無いため短くてよい。
 const CAPSULE_DONE_HIDE_DELAY_MS: u64 = 200;
+
+/// キャンセル後の遅延（ms）。ユーザーが明示的に取り消した操作なので、確認の
+/// 猶予は不要。浮窗は即座に消す。
+const CAPSULE_CANCEL_HIDE_DELAY_MS: u64 = 0;
 
 /// Coordinator 全局超时保护：防止 ASR await_final_result() 永远挂起。
 /// 设置为 15 秒（比 ASR 的 12 秒 FINAL_RESULT_TIMEOUT 稍长），
