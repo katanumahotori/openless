@@ -12,7 +12,11 @@ use thiserror::Error;
 
 use crate::types::{ChineseScriptPreference, OutputLanguagePreference, PolishMode, QaChatMessage};
 
-const DEFAULT_TEMPERATURE: f32 = 0.3;
+// 整文・翻訳は「与えられたテキストを決まったルールで直す」決定論的タスク。
+// temperature を上げてもメリットが無く、上げた分だけ稀に崩れた出力（reasoning
+// 漏れ・反復・崩れた日本語）が混じる。OpenLess の Whisper 呼び出しが既に
+// temperature 0 を使っているのと揃える。
+const DEFAULT_TEMPERATURE: f32 = 0.0;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const BODY_PREVIEW_LIMIT: usize = 200;
 
