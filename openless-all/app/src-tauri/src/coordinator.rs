@@ -39,7 +39,7 @@ use crate::persistence::{
     CredentialAccount, CredentialsVault, DictionaryStore, HistoryStore, PreferencesStore,
 };
 
-use crate::polish::{OpenAICompatibleConfig, OpenAICompatibleLLMProvider};
+use crate::polish::{LLMError, OpenAICompatibleConfig, OpenAICompatibleLLMProvider};
 use crate::qa_hotkey::{QaHotkeyError, QaHotkeyEvent, QaHotkeyMonitor};
 use crate::recorder::{Recorder, RecorderError};
 use crate::selection::{capture_selection, SelectionContext};
@@ -3408,6 +3408,114 @@ fn ensure_qa_volcengine_credentials() -> Result<(), String> {
     }
 }
 
+/// 整形/翻訳 LLM のモデル自動フォールバック。
+///
+/// 無料枠のモデルは「1日あたりトークン上限（TPD）」に達すると HTTP 429 を返す。
+/// 429 が出たモデルはその UTC 日のあいだ「枯渇」扱いにし、次のモデルへ自動で
+/// 切り替える。UTC 日付が変わる（＝クォータがリセットされる）と枯渇マークも
+/// 自動で消えるため、翌日はメインモデルが再び最優先で使われる。
+mod model_fallback {
+    use parking_lot::Mutex;
+
+    struct State {
+        /// 枯渇マークが有効な UTC 日（エポックからの経過日数）。
+        day: i64,
+        /// この日に 429 を返したモデル ID。
+        exhausted: Vec<String>,
+    }
+
+    // parking_lot::Mutex::new / Vec::new は const fn なので static で初期化できる。
+    static STATE: Mutex<State> = Mutex::new(State {
+        day: 0,
+        exhausted: Vec::new(),
+    });
+
+    fn current_utc_day() -> i64 {
+        chrono::Utc::now().timestamp().div_euclid(86_400)
+    }
+
+    /// 日付が変わっていたら枯渇マークを一掃する。呼び出し側で lock 済み。
+    fn roll_day(state: &mut State) {
+        let today = current_utc_day();
+        if state.day != today {
+            state.day = today;
+            state.exhausted.clear();
+        }
+    }
+
+    /// `model` が今日すでに 429（クォータ枯渇）になっているか。
+    pub fn is_exhausted(model: &str) -> bool {
+        let mut state = STATE.lock();
+        roll_day(&mut state);
+        state.exhausted.iter().any(|m| m == model)
+    }
+
+    /// `model` を今日の枯渇モデルとして記録する。
+    pub fn mark_exhausted(model: &str) {
+        let mut state = STATE.lock();
+        roll_day(&mut state);
+        if !state.exhausted.iter().any(|m| m == model) {
+            state.exhausted.push(model.to_string());
+        }
+    }
+}
+
+/// LLM 呼び出し失敗の分類。フォールバック判断に使う。
+enum LlmFailure {
+    /// 429: 1日のトークン上限超過。次モデルへ切替＋枯渇マーク。
+    Quota,
+    /// 5xx / overload: 一時的な障害。次モデルを試すが枯渇マークはしない。
+    Transient,
+    /// 認証エラー・不正リクエスト等。別モデルを試しても無駄なので即返す。
+    Fatal,
+}
+
+fn classify_llm_error(e: &LLMError) -> LlmFailure {
+    match e {
+        LLMError::InvalidResponse { status, .. } if *status == 429 => LlmFailure::Quota,
+        LLMError::InvalidResponse { status, .. } if *status >= 500 => LlmFailure::Transient,
+        _ => LlmFailure::Fatal,
+    }
+}
+
+/// 整形/翻訳のフォールバック用モデルチェーンを組む。
+///
+/// 先頭は必ずユーザーが設定したモデル。後続はプロバイダ既知の予備モデルを
+/// TPD（1日のトークン上限）が大きい順に並べる。メインが 429 になったとき
+/// 順に次へ切り替わる。Groq 無料枠のみ予備モデルが分かっているため、
+/// 他プロバイダでは `[primary]` のみ（＝従来どおり予備なし）。
+fn build_model_chain(primary: &str, base_url: &str) -> Vec<String> {
+    let mut chain = vec![primary.to_string()];
+    if base_url.contains("groq.com") {
+        // TPD 降順: qwen3-32b(500K) > gpt-oss-120b(200K) > llama-3.3-70b(100K)
+        for m in [
+            "qwen/qwen3-32b",
+            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
+        ] {
+            if !chain.iter().any(|c| c == m) {
+                chain.push(m.to_string());
+            }
+        }
+    }
+    chain
+}
+
+/// 枯渇キャッシュを反映した「今回試すモデル順」を返す。今日ダメと分かっている
+/// モデルは除外する。全モデルが枯渇扱いなら（最後の望みとして）チェーン全体を
+/// 返す。
+fn models_to_try(chain: &[String]) -> Vec<&String> {
+    let active: Vec<&String> = chain
+        .iter()
+        .filter(|m| !model_fallback::is_exhausted(m.as_str()))
+        .collect();
+    if active.is_empty() {
+        chain.iter().collect()
+    } else {
+        active
+    }
+}
+
 /// 润色文本；失败时返回原文 + 失败原因，调用方据此弹错误胶囊 + 写历史 error_code。
 /// 之前固定返回 String，调用方拿不到失败信号 → 用户感知"为什么风格设置没生效"。issue #57。
 #[allow(clippy::too_many_arguments)]
@@ -3472,22 +3580,62 @@ async fn polish_text(
         .trim_end_matches('/')
         .to_string();
 
-    let config = OpenAICompatibleConfig::new("ark", "Doubao Ark", base_url, api_key, model);
-    let provider = OpenAICompatibleLLMProvider::new(config);
-    Ok(provider
-        .polish(
-            raw,
-            mode,
-            hotwords,
-            universal_directives,
-            working_languages,
-            chinese_script_preference,
-            output_language_preference,
-            front_app,
-            prior_turns,
-            prompt_override,
-        )
-        .await?)
+    let chain = build_model_chain(&model, &base_url);
+    let try_list = models_to_try(&chain);
+    let mut last_err: Option<LLMError> = None;
+    for candidate in try_list {
+        let config = OpenAICompatibleConfig::new(
+            "ark",
+            "Doubao Ark",
+            base_url.clone(),
+            api_key.clone(),
+            candidate.clone(),
+        );
+        let provider = OpenAICompatibleLLMProvider::new(config);
+        let result = provider
+            .polish(
+                raw,
+                mode.clone(),
+                hotwords,
+                universal_directives,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                front_app,
+                prior_turns,
+                prompt_override,
+            )
+            .await;
+        match result {
+            Ok(s) => {
+                if candidate != &model {
+                    log::warn!(
+                        "[coord] polish: メインモデル '{model}' が使えないため予備モデル '{candidate}' で整形しました"
+                    );
+                }
+                return Ok(s);
+            }
+            Err(e) => match classify_llm_error(&e) {
+                LlmFailure::Quota => {
+                    log::warn!(
+                        "[coord] polish: モデル '{candidate}' がクォータ超過 (429)、次のモデルへ切替"
+                    );
+                    model_fallback::mark_exhausted(candidate);
+                    last_err = Some(e);
+                }
+                LlmFailure::Transient => {
+                    log::warn!(
+                        "[coord] polish: モデル '{candidate}' で一時的エラー ({e})、次のモデルへ切替"
+                    );
+                    last_err = Some(e);
+                }
+                LlmFailure::Fatal => return Err(e.into()),
+            },
+        }
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("polish failed: 利用可能なモデルがありません")))
 }
 
 /// 翻译路径——和 polish 一样失败时返回原文 + 失败原因，避免"不丢字"约定被违反（CLAUDE.md）。
@@ -3541,19 +3689,59 @@ async fn translate_text(
         .trim_end_matches('/')
         .to_string();
 
-    let config = OpenAICompatibleConfig::new("ark", "Doubao Ark", base_url, api_key, model);
-    let provider = OpenAICompatibleLLMProvider::new(config);
-    Ok(provider
-        .translate_to(
-            raw,
-            target_language,
-            universal_directives,
-            working_languages,
-            chinese_script_preference,
-            output_language_preference,
-            front_app,
-        )
-        .await?)
+    let chain = build_model_chain(&model, &base_url);
+    let try_list = models_to_try(&chain);
+    let mut last_err: Option<LLMError> = None;
+    for candidate in try_list {
+        let config = OpenAICompatibleConfig::new(
+            "ark",
+            "Doubao Ark",
+            base_url.clone(),
+            api_key.clone(),
+            candidate.clone(),
+        );
+        let provider = OpenAICompatibleLLMProvider::new(config);
+        let result = provider
+            .translate_to(
+                raw,
+                target_language,
+                universal_directives,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                front_app,
+            )
+            .await;
+        match result {
+            Ok(s) => {
+                if candidate != &model {
+                    log::warn!(
+                        "[coord] translate: メインモデル '{model}' が使えないため予備モデル '{candidate}' で翻訳しました"
+                    );
+                }
+                return Ok(s);
+            }
+            Err(e) => match classify_llm_error(&e) {
+                LlmFailure::Quota => {
+                    log::warn!(
+                        "[coord] translate: モデル '{candidate}' がクォータ超過 (429)、次のモデルへ切替"
+                    );
+                    model_fallback::mark_exhausted(candidate);
+                    last_err = Some(e);
+                }
+                LlmFailure::Transient => {
+                    log::warn!(
+                        "[coord] translate: モデル '{candidate}' で一時的エラー ({e})、次のモデルへ切替"
+                    );
+                    last_err = Some(e);
+                }
+                LlmFailure::Fatal => return Err(e.into()),
+            },
+        }
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("translate failed: 利用可能なモデルがありません")))
 }
 
 fn read_whisper_credentials() -> (String, String, String) {
@@ -4273,6 +4461,69 @@ mod tests {
         )
         .unwrap();
         assert_eq!(endpoint, "https://example.com/v1/chat/completions");
+    }
+
+    #[test]
+    fn build_model_chain_groq_appends_fallbacks_in_tpd_order() {
+        let chain = build_model_chain("openai/gpt-oss-120b", "https://api.groq.com/openai/v1");
+        // 先頭は必ずユーザー設定のモデル。
+        assert_eq!(chain[0], "openai/gpt-oss-120b");
+        // 重複は除かれる（primary が gpt-oss-120b なので予備リストの同名は出ない）。
+        assert_eq!(
+            chain,
+            vec![
+                "openai/gpt-oss-120b".to_string(),
+                "qwen/qwen3-32b".to_string(),
+                "llama-3.3-70b-versatile".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_model_chain_groq_keeps_unknown_primary_then_all_fallbacks() {
+        let chain = build_model_chain("qwen/qwen3-32b", "https://api.groq.com/openai/v1");
+        assert_eq!(chain[0], "qwen/qwen3-32b");
+        // qwen3-32b は予備リストにもあるので重複排除され、合計 3 件。
+        assert_eq!(chain.len(), 3);
+        assert!(chain.contains(&"openai/gpt-oss-120b".to_string()));
+        assert!(chain.contains(&"llama-3.3-70b-versatile".to_string()));
+    }
+
+    #[test]
+    fn build_model_chain_non_groq_has_no_fallback() {
+        let chain = build_model_chain(
+            "deepseek-v3-2",
+            "https://ark.cn-beijing.volces.com/api/v3",
+        );
+        assert_eq!(chain, vec!["deepseek-v3-2".to_string()]);
+    }
+
+    #[test]
+    fn classify_llm_error_quota_vs_transient_vs_fatal() {
+        let quota = LLMError::InvalidResponse {
+            status: 429,
+            body: String::new(),
+        };
+        assert!(matches!(classify_llm_error(&quota), LlmFailure::Quota));
+
+        let transient = LLMError::InvalidResponse {
+            status: 503,
+            body: String::new(),
+        };
+        assert!(matches!(
+            classify_llm_error(&transient),
+            LlmFailure::Transient
+        ));
+
+        let fatal = LLMError::InvalidResponse {
+            status: 401,
+            body: String::new(),
+        };
+        assert!(matches!(classify_llm_error(&fatal), LlmFailure::Fatal));
+        assert!(matches!(
+            classify_llm_error(&LLMError::MissingCredentials),
+            LlmFailure::Fatal
+        ));
     }
 
     #[test]
