@@ -2054,29 +2054,33 @@ fn should_try_non_tsf_insertion_fallback(
 fn insert_via_non_tsf_fallback(
     inner: &Arc<Inner>,
     polished: &str,
-    _restore_clipboard: bool,
-    _paste_shortcut: PasteShortcut,
+    restore_clipboard: bool,
+    paste_shortcut: PasteShortcut,
 ) -> InsertStatus {
-    let status = finish_non_tsf_insertion_fallback(
-        || inner.inserter.insert_via_unicode_keystrokes(polished),
-        || inner.inserter.copy_fallback(polished),
-    );
+    // TSF（OpenLess IME）が使えないときの挿入フォールバック。
+    //
+    // 文字ごとに送る Unicode SendInput は、Windows + 日本語 IME 環境やリッチな
+    // 入力欄（ブラウザ/Electron 等）で **順序崩れ・取りこぼし** を起こす
+    // （「一文字ごとに」→「りごとに」等）。代わりにクリップボード貼り付け
+    // （Ctrl+V）で一括挿入する：原子的なので崩れない。旧フォークがこの方式で
+    // 安定していた。貼り付け後はユーザーの元クリップボードを復元する。
+    let status = inner
+        .inserter
+        .insert(polished, restore_clipboard, paste_shortcut);
 
     match status {
-        InsertStatus::Inserted => {
-            log::warn!(
-                "[windows-ime] TSF unavailable; inserted via paced Unicode SendInput fallback"
+        InsertStatus::Inserted | InsertStatus::PasteSent => {
+            log::info!(
+                "[windows-ime] TSF unavailable; inserted via clipboard paste (Ctrl+V) fallback"
             );
         }
         InsertStatus::CopiedFallback => {
             log::warn!(
-                "[windows-ime] TSF unavailable; Unicode SendInput failed, left text on clipboard"
+                "[windows-ime] TSF unavailable; paste not confirmed, text left on clipboard"
             );
         }
-        InsertStatus::PasteSent | InsertStatus::Failed => {
-            log::warn!(
-                "[windows-ime] TSF unavailable; Unicode SendInput fallback failed and copy fallback failed"
-            );
+        InsertStatus::Failed => {
+            log::warn!("[windows-ime] TSF unavailable; clipboard paste fallback failed");
         }
     }
 
