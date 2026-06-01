@@ -388,13 +388,26 @@ fn finalize_polished_text(
     }
 }
 
+/// このフォークでは日本語正規化（句読点の全角化・余分なスペース除去）を確実に
+/// 効かせるため、当面ストリーミング挿入を無効化し、一括整形（one-shot →
+/// clean_polish_output → normalize_japanese_punctuation）経路を使う。
+///
+/// ストリーミングは文字を逐次キー入力で画面に落とすため、本家も
+/// apply_correction_rules 等の後処理をスキップしている（後から戻せない）。
+/// 日本語正規化も同じ理由でストリーミングと両立しない。1 文字先読みの
+/// ストリーミング対応正規化器を実装したら true に戻す。
+const STREAMING_INSERT_PORTED: bool = false;
+
 fn streaming_insert_eligible(
     streaming_insert_enabled: bool,
     translation_active: bool,
     mode: PolishMode,
     raw_uses_llm: bool,
 ) -> bool {
-    streaming_insert_enabled && !translation_active && (mode != PolishMode::Raw || raw_uses_llm)
+    STREAMING_INSERT_PORTED
+        && streaming_insert_enabled
+        && !translation_active
+        && (mode != PolishMode::Raw || raw_uses_llm)
 }
 
 fn default_done_message(status: InsertStatus, polish_failed: bool) -> Option<String> {

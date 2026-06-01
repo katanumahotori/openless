@@ -15,7 +15,11 @@ use thiserror::Error;
 
 use crate::types::{ChineseScriptPreference, OutputLanguagePreference, PolishMode, QaChatMessage};
 
-const DEFAULT_TEMPERATURE: f32 = 0.3;
+// 整文・翻訳は「与えられたテキストを決まったルールで直す」決定論的タスク。
+// temperature を上げてもメリットが無く、上げた分だけ稀に崩れた出力（reasoning
+// 漏れ・反復・崩れた日本語）が混じる。Whisper 呼び出しが temperature 0 を
+// 使っているのと揃える。
+const DEFAULT_TEMPERATURE: f32 = 0.0;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const BODY_PREVIEW_LIMIT: usize = 200;
 pub const CODEX_OAUTH_PROVIDER_ID: &str = "codex_oauth";
@@ -80,6 +84,11 @@ pub enum LLMError {
     ParseError(String),
     #[error("codex oauth credentials unavailable: {0}")]
     CodexAuth(String),
+    /// レスポンスは HTTP 200 だが、整形結果（content）が空。推論モデルが
+    /// 思考にトークンを使い切り最終回答を出さなかった等。フォールバック
+    /// （次モデル→生テキスト）の対象にするため独立した variant にする。
+    #[error("empty response content")]
+    EmptyResponse,
 }
 
 pub enum ActiveLLMProvider {
@@ -492,6 +501,7 @@ impl OpenAICompatibleLLMProvider {
             "messages": messages,
         });
         apply_openai_compatible_thinking_control(&mut body, &self.config);
+        apply_model_based_reasoning_effort(&mut body, &self.config);
         body
     }
 
@@ -1536,6 +1546,39 @@ fn apply_openai_compatible_thinking_control(body: &mut Value, config: &OpenAICom
     }
 }
 
+/// provider-id ベースの thinking 制御が効かないカスタムプロバイダ（Groq を
+/// "ark" スロットで使う構成など）向けに、**モデル名**で reasoning_effort を補う。
+///
+/// 整形/翻訳はほぼ機械的なタスクで深い推論は不要。推論モデルは既定だと答える前に
+/// 長く「考え」、レイテンシが 0.3〜4 秒とばらつき、推論にトークンを使い切って
+/// content が空になる事故も起きる。思考を抑えると速く・安定し、空応答も減る。
+///
+/// - gpt-oss（20b/120b）… `low`（最小値。`none` は非対応）
+/// - Qwen3 … `none`（thinking を完全オフにできる）
+///
+/// すでに `apply_openai_compatible_thinking_control` が `reasoning_effort` /
+/// `enable_thinking` / `reasoning` / `thinking` のいずれかを設定済みなら、
+/// そちらを優先して何もしない（provider-id ベースの公式制御を壊さない）。
+fn apply_model_based_reasoning_effort(body: &mut Value, config: &OpenAICompatibleConfig) {
+    // 公式の provider-id ベース制御が効くプロバイダは触らない。
+    if openai_compatible_thinking_control(&config.provider_id).is_some() {
+        return;
+    }
+    let model = config.model.as_str();
+    let effort = if model.contains("gpt-oss") {
+        Some("low")
+    } else if model.contains("qwen3") || model.contains("qwen-3") {
+        Some("none")
+    } else {
+        None
+    };
+    if let Some(effort) = effort {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("reasoning_effort".to_string(), json!(effort));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThinkingControl {
     ReasoningEffort,
@@ -1839,12 +1882,22 @@ fn extract_assistant_content(body: &str) -> Result<String, LLMError> {
     let first = choices
         .first()
         .ok_or_else(|| LLMError::ParseError("choices array is empty".into()))?;
+    // content が空文字 / null / 欠落のときは EmptyResponse として扱う。
+    // 推論モデル（gpt-oss 等）が思考チャネルにトークンを使い切り、最終回答
+    // チャネル（content）を空のまま返すことがある。ここを ParseError に
+    // すると整形が即失敗扱い（Fatal）になり、フォールバックも生テキスト
+    // 退避も働かず「テキストが丸ごと消える」。EmptyResponse なら呼び出し側
+    // が次モデル→生テキストへ退避できる。
     let content = first
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .ok_or_else(|| LLMError::ParseError("message.content is not a string".into()))?;
-    Ok(clean_polish_output(content))
+        .unwrap_or("");
+    let cleaned = clean_polish_output(content);
+    if cleaned.trim().is_empty() {
+        return Err(LLMError::EmptyResponse);
+    }
+    Ok(cleaned)
 }
 
 /// Best-effort cleanup of common LLM "introduction" prefixes and markdown fences.
@@ -1871,7 +1924,128 @@ pub(crate) fn clean_polish_output(content: &str) -> String {
         }
     }
 
-    output.trim().to_string()
+    normalize_japanese_punctuation(output.trim())
+}
+
+/// 文字が「日本語の本文文字」かどうか。約物変換の文脈判定に使う。
+fn is_japanese_char(c: char) -> bool {
+    matches!(c,
+        // ひらがな + カタカナ
+        '\u{3040}'..='\u{30ff}'
+        // CJK統合漢字 + 拡張A
+        | '\u{3400}'..='\u{4dbf}'
+        | '\u{4e00}'..='\u{9fff}'
+        // 全角英数・記号（半角の対の全角形）
+        | '\u{ff00}'..='\u{ffef}'
+        // 長音符・全角スペース・代表的な全角約物
+        | '\u{30fc}' | '　' | '、' | '。' | '！' | '？'
+        | '「' | '」' | '『' | '』' | '（' | '）')
+}
+
+/// `chars[idx]` が存在し、日本語文字なら true。
+fn src_is_japanese_at(chars: &[char], idx: usize) -> bool {
+    chars.get(idx).map(|&c| is_japanese_char(c)).unwrap_or(false)
+}
+
+/// 日本語テキストの ASCII 約物を全角に決定論的に正規化する。
+///
+/// LLM へ「半角禁止・全角を使え」とプロンプトで指示しても遵守は不安定
+/// （特に長い custom prompt の末尾に足したルールは埋もれる）。半角→全角は
+/// 純粋に機械的な変換なので、LLM ではなくここで確実に行う。
+///
+/// 文脈依存：ASCII 約物の **直前が日本語文字** のときだけ変換する。これにより
+/// `3.14` `1,000` `example.com` `.json` `a.m.` 等の数字・英字・URL・コード・
+/// 英文は変換されない（直前が ASCII のため）。さらに `.` `,` は **直後が
+/// ASCII 英数字** のとき変換しない：`進捗.md` のようなファイル拡張子・小数・
+/// 桁区切りの区切り文字を句読点に化けさせないため。
+///
+/// 変換規則:
+/// - `.`→`。`  `,`→`、`（直前が日本語文字 かつ 直後が ASCII 英数字でないとき）
+/// - `!`→`！`  `?`→`？`（直前が日本語文字のときのみ）
+/// - `！`/`？` の直後：半角/全角スペースの連続を全角スペース `　` 1つに畳む。
+///   スペースが無ければ補う。ただし文末・改行直前・閉じ括弧や別の約物が
+///   続く場合は補わない。
+/// - 言葉の切れ目に紛れ込んだ半角スペースを除去（前後どちらかが日本語文字の
+///   とき）。日本語文に語間スペースは無いため誤挿入とみなす。英単語間
+///   （両側 ASCII）のスペースは残す。
+/// - 全角スペース `　` は **！？ の直後だけ** 残し、それ以外（句点・読点の
+///   後や語中）は除去する。規約上 全角スペースは ！？ の後のみ許可。
+fn normalize_japanese_punctuation(text: &str) -> String {
+    // Pass 1: ASCII 約物 → 全角（直前が日本語文字のときだけ）
+    let src: Vec<char> = text.chars().collect();
+    let mut p1 = String::with_capacity(text.len() + 16);
+    for (idx, &c) in src.iter().enumerate() {
+        let prev_ja = p1.chars().last().map(is_japanese_char).unwrap_or(false);
+        // 直後が ASCII 英数字なら、拡張子(.md) / 小数(3.14) / 桁区切り(1,000)
+        // 等の一部とみなし、`.` `,` は句読点に変換しない。
+        let next_ascii_alnum = src
+            .get(idx + 1)
+            .map(|n| n.is_ascii_alphanumeric())
+            .unwrap_or(false);
+        match c {
+            '.' if prev_ja && !next_ascii_alnum => p1.push('。'),
+            ',' if prev_ja && !next_ascii_alnum => p1.push('、'),
+            '!' if prev_ja => p1.push('！'),
+            '?' if prev_ja => p1.push('？'),
+            other => p1.push(other),
+        }
+    }
+
+    // Pass 2: ！？ の直後のスペースを全角スペース1つに正規化
+    let chars: Vec<char> = p1.chars().collect();
+    let mut p2 = String::with_capacity(p1.len() + 16);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        p2.push(c);
+        if c == '！' || c == '？' {
+            // 後続の空白（半角/全角/タブ）をまとめて読み飛ばす
+            let mut j = i + 1;
+            while j < chars.len() && matches!(chars[j], ' ' | '\u{3000}' | '\t') {
+                j += 1;
+            }
+            // 次の実文字が「文の続き」なら全角スペースを1つ入れる。
+            // 文末・改行・閉じ括弧・別の約物の前には入れない。
+            let needs_space = match chars.get(j) {
+                None => false,
+                Some(nx) => !matches!(
+                    nx,
+                    '\n' | '\r'
+                        | '」' | '』' | '）' | ')'
+                        | '！' | '？' | '。' | '、' | '!' | '?'
+                ),
+            };
+            if needs_space {
+                p2.push('\u{3000}');
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+
+    // Pass 3: 不要なスペースを除去する。
+    //  - 半角スペース ' ' … 前後どちらかが日本語文字なら誤挿入とみなし除去。
+    //    両側が ASCII（英単語間）のときだけ残す。
+    //  - 全角スペース '　' … 直前が ！？ のときだけ残す。句点・読点の直後や
+    //    語中など、それ以外に出た全角スペースはモデルの誤り（！？用ルールの
+    //    過剰適用）なので除去。Pass 2 が入れた ！？ 直後の `　` は残る。
+    let chars: Vec<char> = p2.chars().collect();
+    let mut out = String::with_capacity(p2.len());
+    for (idx, &c) in chars.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|p| chars.get(p)).copied();
+        if c == ' ' {
+            let prev_ja = prev.map(is_japanese_char).unwrap_or(false);
+            let next_ja = src_is_japanese_at(&chars, idx + 1);
+            if prev_ja || next_ja {
+                continue; // 半角スペースを落とす
+            }
+        } else if c == '\u{3000}' && !matches!(prev, Some('！') | Some('？')) {
+            continue; // ！？ 直後以外の全角スペースを落とす
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Strip model reasoning blocks so only the final polished text is inserted.
@@ -2614,6 +2788,160 @@ mod tests {
             s.contains("当前") && s.contains("最新"),
             "需要明确：只输出当前最新一条"
         );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_converts_after_japanese_chars() {
+        assert_eq!(
+            normalize_japanese_punctuation("これはすごい.やったね"),
+            "これはすごい。やったね"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("そうだね,たぶん"),
+            "そうだね、たぶん"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("Pythonを使う."),
+            "Pythonを使う。"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_protects_ascii_context() {
+        assert_eq!(normalize_japanese_punctuation("3.14"), "3.14");
+        assert_eq!(normalize_japanese_punctuation("1,000円"), "1,000円");
+        assert_eq!(
+            normalize_japanese_punctuation("see example.com for docs"),
+            "see example.com for docs"
+        );
+        // 直前が日本語でも、直後が ASCII 英数字なら拡張子等とみなし変換しない。
+        assert_eq!(
+            normalize_japanese_punctuation("config.json を読む"),
+            "config.jsonを読む"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_keeps_file_extension_dot() {
+        assert_eq!(normalize_japanese_punctuation("進捗.md"), "進捗.md");
+        assert_eq!(
+            normalize_japanese_punctuation("進捗.md ですよ"),
+            "進捗.mdですよ"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("これで完了です."),
+            "これで完了です。"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_fullwidth_space_after_bang() {
+        assert_eq!(
+            normalize_japanese_punctuation("すごい!本当に?やった"),
+            "すごい！　本当に？　やった"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("やった! すごい"),
+            "やった！　すごい"
+        );
+        assert_eq!(normalize_japanese_punctuation("やったね!"), "やったね！");
+        assert_eq!(
+            normalize_japanese_punctuation("「すごい!」と言った"),
+            "「すごい！」と言った"
+        );
+    }
+
+    #[test]
+    fn normalize_japanese_punctuation_strips_stray_spaces() {
+        // 前後どちらかが日本語文字の半角スペースは誤挿入として除去。
+        assert_eq!(
+            normalize_japanese_punctuation("入ってるね。 今使ってる"),
+            "入ってるね。今使ってる"
+        );
+        // 英単語間（両側 ASCII）の半角スペースは残す。
+        assert_eq!(
+            normalize_japanese_punctuation("this is a test"),
+            "this is a test"
+        );
+        // 句点直後・語中の全角スペースは除去（！？用ルールの過剰適用）。
+        assert_eq!(
+            normalize_japanese_punctuation("完了です。　次の話"),
+            "完了です。次の話"
+        );
+        assert_eq!(
+            normalize_japanese_punctuation("これは　テスト"),
+            "これはテスト"
+        );
+        // ！？ の直後の全角スペースは残す（規約どおり）。
+        assert_eq!(
+            normalize_japanese_punctuation("すごい！　本当に"),
+            "すごい！　本当に"
+        );
+    }
+
+    #[test]
+    fn extract_assistant_content_empty_content_is_empty_response_error() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"","reasoning":"考え中..."}}]}"#;
+        assert!(matches!(
+            extract_assistant_content(body),
+            Err(LLMError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn extract_assistant_content_null_content_is_empty_response_error() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null}}]}"#;
+        assert!(matches!(
+            extract_assistant_content(body),
+            Err(LLMError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn extract_assistant_content_think_only_is_empty_response_error() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"<think>分析のみ</think>"}}]}"#;
+        assert!(matches!(
+            extract_assistant_content(body),
+            Err(LLMError::EmptyResponse)
+        ));
+    }
+
+    #[test]
+    fn extract_assistant_content_normal_content_ok() {
+        let body = r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"これは整形済みの文章です。"}}]}"#;
+        assert_eq!(
+            extract_assistant_content(body).unwrap(),
+            "これは整形済みの文章です。"
+        );
+    }
+
+    #[test]
+    fn apply_model_based_reasoning_effort_for_custom_provider_groq_models() {
+        // "ark" スロット（provider-id 制御なし）＝ Groq 構成。モデル名で補う。
+        let cfg_gpt = OpenAICompatibleConfig::new(
+            "ark", "Groq", "https://api.groq.com/openai/v1", "k", "openai/gpt-oss-20b",
+        );
+        let mut body = json!({});
+        apply_model_based_reasoning_effort(&mut body, &cfg_gpt);
+        assert_eq!(body.get("reasoning_effort").and_then(|v| v.as_str()), Some("low"));
+
+        let cfg_qwen = OpenAICompatibleConfig::new(
+            "ark", "Groq", "https://api.groq.com/openai/v1", "k", "qwen/qwen3-32b",
+        );
+        let mut body = json!({});
+        apply_model_based_reasoning_effort(&mut body, &cfg_qwen);
+        assert_eq!(body.get("reasoning_effort").and_then(|v| v.as_str()), Some("none"));
+    }
+
+    #[test]
+    fn apply_model_based_reasoning_effort_skips_official_provider() {
+        // provider-id="openai" は公式制御に任せ、モデル名ベースは何もしない。
+        let cfg = OpenAICompatibleConfig::new(
+            "openai", "OpenAI", "https://api.openai.com/v1", "k", "openai/gpt-oss-20b",
+        );
+        let mut body = json!({});
+        apply_model_based_reasoning_effort(&mut body, &cfg);
+        assert!(body.get("reasoning_effort").is_none());
     }
 
     #[test]
