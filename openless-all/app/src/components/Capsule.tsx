@@ -196,8 +196,9 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
           <span
             style={{
               // v1.3.1-7 用户拍板：黑色底字 + 蓝色扫光（亮黄太显眼，黑底更稳）。
-              // 字号保持 17，字重 700 → 600 稍细一些。
-              fontSize: 17,
+              // 字重 700 → 600 稍细一些。字号は 17 だと日本語ラベル「整形中…」が
+              // カプセル幅(textWidth ~88-104px)で 2 行に折り返すため 13 に縮小。
+              fontSize: 13,
               fontWeight: 600,
               letterSpacing: 0.3,
               // line-height: 1 下 g/y/p 等下伸字符会被 clip，给 padding 留 descender 空间。
