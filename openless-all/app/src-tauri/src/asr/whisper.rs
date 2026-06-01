@@ -109,7 +109,14 @@ impl WhisperBatchASR {
             .context("set MIME type")?;
         let mut form = reqwest::multipart::Form::new()
             .part("file", wav_part)
-            .text("model", self.model.clone());
+            .text("model", self.model.clone())
+            // verbose_json でセグメント単位のメタデータ（no_speech_prob /
+            // avg_logprob / compression_ratio）を取得する。これを使って
+            // Whisper の幻聴（無音・ノイズ区間での作話）セグメントを捨てる。
+            .text("response_format", "verbose_json")
+            // 文字起こしは決定論的タスク。temperature を明示 0 にして
+            // ランダムな作話の余地を減らす。
+            .text("temperature", "0");
 
         // `prompt` は空文字を送らない：OpenAI 互換実装によっては空文字でエラーに
         // なるリスクがある（Groq は許容するが防御的にスキップ）。`trim()` で
@@ -137,7 +144,10 @@ impl WhisperBatchASR {
         }
 
         let json: serde_json::Value = resp.json().await.context("parse Whisper response")?;
-        Ok(json["text"].as_str().unwrap_or("").trim().to_string())
+        let text = extract_confident_text(&json);
+        // 辞書プロンプトの echo（ユーザーが言っていない辞書語の羅列）を除去。
+        let text = strip_prompt_echo(&text, self.prompt.as_deref());
+        Ok(text)
     }
 
     pub fn cancel(&self) {
@@ -149,6 +159,163 @@ impl crate::recorder::AudioConsumer for WhisperBatchASR {
     fn consume_pcm_chunk(&self, pcm: &[u8]) {
         self.buffer.lock().extend_from_slice(pcm);
     }
+}
+
+/// verbose_json レスポンスから、幻聴と思われるセグメントを除いた本文を組む。
+///
+/// Whisper は無音・小音・ノイズ区間で「もっともらしいが言っていない」テキストを
+/// 生成する既知の欠陥（hallucination）がある。録音の前後の沈黙やマイクのノイズが
+/// 無関係な単語に化けるのがこれ。verbose_json の各セグメントが持つ
+/// `no_speech_prob` / `avg_logprob` / `compression_ratio` を見て、明らかに
+/// 発話でないセグメントを捨てる。
+///
+/// 判定（いずれかに該当したら捨てる）:
+/// - `no_speech_prob > 0.6` かつ `avg_logprob < -0.5`
+///   → 無音確率が高く信頼度も低い。沈黙を作話したセグメント。
+/// - `compression_ratio > 2.4`
+///   → 同一フレーズの反復幻聴（Whisper 標準の閾値）。
+/// - `avg_logprob < -1.0`
+///   → 信頼度が極端に低い。ノイズを単語化したセグメント。
+///
+/// 実発話を誤って捨てるのが最悪なので、閾値は保守的に設定している。
+/// `segments` が無いレスポンスでは従来どおり `text` をそのまま使う。
+fn extract_confident_text(json: &serde_json::Value) -> String {
+    let Some(segments) = json.get("segments").and_then(|s| s.as_array()) else {
+        return json["text"].as_str().unwrap_or("").trim().to_string();
+    };
+
+    let mut kept = String::new();
+    for seg in segments {
+        let text = seg.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        if text.trim().is_empty() {
+            continue;
+        }
+        let no_speech = seg
+            .get("no_speech_prob")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let avg_logprob = seg
+            .get("avg_logprob")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        let compression = seg
+            .get("compression_ratio")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0);
+
+        let is_hallucination = (no_speech > 0.6 && avg_logprob < -0.5)
+            || compression > 2.4
+            || avg_logprob < -1.0;
+        if is_hallucination {
+            log::warn!(
+                "[whisper] 幻聴セグメントを除外: no_speech={:.2} avg_logprob={:.2} compression={:.2} text={:?}",
+                no_speech,
+                avg_logprob,
+                compression,
+                text.trim()
+            );
+            continue;
+        }
+        kept.push_str(text);
+    }
+
+    let kept = kept.trim().to_string();
+    if kept.is_empty() {
+        // 全セグメントが除外された（＝ほぼ無音録音）。フォールバックで
+        // 生 text を返すと幻聴を拾い直すので、空のまま返す。上位は空転写を
+        // 「何も話していない」として無害に扱う。
+        return String::new();
+    }
+    kept
+}
+
+/// 2 つの文字列の最長共通部分文字列を返す `(a 内開始位置, 長さ)`。
+/// 長さ 0 のときは `(0, 0)`。
+fn longest_common_substring(a: &[char], b: &[char]) -> (usize, usize) {
+    if a.is_empty() || b.is_empty() {
+        return (0, 0);
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut best_len = 0usize;
+    let mut best_end_in_a = 0usize;
+    for i in 1..=a.len() {
+        let mut curr = vec![0usize; b.len() + 1];
+        for j in 1..=b.len() {
+            if a[i - 1] == b[j - 1] {
+                curr[j] = prev[j - 1] + 1;
+                if curr[j] > best_len {
+                    best_len = curr[j];
+                    best_end_in_a = i;
+                }
+            }
+        }
+        prev = curr;
+    }
+    (best_end_in_a - best_len, best_len)
+}
+
+/// Whisper が `prompt`（辞書語の `", "` 連結）を出力に echo（漏出）させた
+/// 断片を取り除く。
+///
+/// Whisper には prompt の内容を書き起こしに紛れ込ませる既知の欠陥があり、
+/// ユーザーが言っていない辞書語が「片沼ほとり, ADOS,」のようにカンマ込みで
+/// 出力されることがある。prompt は既知文字列なので、出力と prompt の最長共通
+/// 部分文字列を取り、それが **カンマ様の区切りを含む**（＝辞書語の羅列）なら
+/// echo とみなして除去する。カンマを含まない＝単独語の一致は、ユーザーが実際に
+/// その語を言った正当なケースと区別できないため除去しない。
+fn strip_prompt_echo(text: &str, prompt: Option<&str>) -> String {
+    let Some(prompt) = prompt else {
+        return text.to_string();
+    };
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return text.to_string();
+    }
+    let prompt_chars: Vec<char> = prompt.chars().collect();
+    let mut text_chars: Vec<char> = text.chars().collect();
+
+    const MIN_ECHO_LEN: usize = 5;
+    let is_comma = |c: char| matches!(c, ',' | '，' | '、');
+    let is_sep = |c: char| c.is_whitespace() || is_comma(c);
+
+    // 複数の echo 断片がありうるので、見つからなくなるまで繰り返す。
+    loop {
+        let (start, len) = longest_common_substring(&text_chars, &prompt_chars);
+        if len < MIN_ECHO_LEN {
+            break;
+        }
+        let frag = &text_chars[start..start + len];
+        if !frag.iter().copied().any(is_comma) {
+            // カンマを含まない一致は単独語。正当な発話の可能性があり除去しない。
+            break;
+        }
+        log::warn!(
+            "[whisper] prompt echo を除去: {:?}",
+            frag.iter().collect::<String>()
+        );
+        text_chars.drain(start..start + len);
+
+        // 除去で区切りが二重化したときだけ畳む：除去点の前後がどちらも
+        // 区切り（カンマ/空白）なら、後ろ側の区切り連続を削って 1 つにする。
+        // 片側だけが区切りの場合はユーザーが実際に打った句読点なので残す。
+        let head_sep = start > 0 && is_sep(text_chars[start - 1]);
+        let tail_sep = start < text_chars.len() && is_sep(text_chars[start]);
+        if head_sep && tail_sep {
+            while start < text_chars.len() && is_sep(text_chars[start]) {
+                text_chars.remove(start);
+            }
+        }
+    }
+
+    // 先頭・末尾に残った区切りを除去（echo が文頭/文末にあった場合）。
+    let mut result: Vec<char> = text_chars;
+    while result.first().is_some_and(|&c| is_sep(c)) {
+        result.remove(0);
+    }
+    while result.last().is_some_and(|&c| is_sep(c)) {
+        result.pop();
+    }
+    result.iter().collect()
 }
 
 fn pcm_duration_ms(pcm: &[u8]) -> u64 {
@@ -453,6 +620,60 @@ mod tests {
         assert!(prompt.contains("entry001"));
         // 100 件 × 8 文字以上は確実に予算超過 → 末尾は入らない
         assert!(!prompt.contains("entry099"));
+    }
+
+    #[test]
+    fn strip_prompt_echo_removes_comma_joined_dictionary_run() {
+        let prompt = "梁山泊, 片沼ほとり, ADOS, TRC.";
+        // 文中に prompt の断片が echo された
+        let text = "逆に言うと、片沼ほとり, ADOS, をこっちに移す";
+        let out = strip_prompt_echo(text, Some(prompt));
+        assert!(!out.contains("ADOS"), "echo が残っている: {out}");
+        assert!(out.contains("逆に言うと"));
+        assert!(out.contains("こっちに移す"));
+    }
+
+    #[test]
+    fn strip_prompt_echo_at_start_trims_leading_separators() {
+        let prompt = "梁山泊, 片沼ほとり, TRC.";
+        let text = "梁山泊, 片沼ほとり, 実際に話した内容";
+        let out = strip_prompt_echo(text, Some(prompt));
+        assert_eq!(out, "実際に話した内容");
+    }
+
+    #[test]
+    fn strip_prompt_echo_keeps_legit_single_word() {
+        // カンマを含まない単独一致は、ユーザーが実際にその語を言った可能性が
+        // あるので除去しない。
+        let prompt = "梁山泊, 片沼ほとり, TRC.";
+        let text = "梁山泊について話します";
+        assert_eq!(
+            strip_prompt_echo(text, Some(prompt)),
+            "梁山泊について話します"
+        );
+    }
+
+    #[test]
+    fn strip_prompt_echo_no_prompt_is_noop() {
+        assert_eq!(strip_prompt_echo("普通の文章です", None), "普通の文章です");
+    }
+
+    #[test]
+    fn extract_confident_text_drops_hallucinated_segment() {
+        let json = serde_json::json!({
+            "text": "本当の発話 幻聴",
+            "segments": [
+                {"text": "本当の発話", "no_speech_prob": 0.01, "avg_logprob": -0.2, "compression_ratio": 1.2},
+                {"text": "幻聴", "no_speech_prob": 0.9, "avg_logprob": -0.8, "compression_ratio": 1.1},
+            ]
+        });
+        assert_eq!(extract_confident_text(&json), "本当の発話");
+    }
+
+    #[test]
+    fn extract_confident_text_falls_back_to_text_without_segments() {
+        let json = serde_json::json!({ "text": "  素の文字起こし  " });
+        assert_eq!(extract_confident_text(&json), "素の文字起こし");
     }
 
     #[test]
