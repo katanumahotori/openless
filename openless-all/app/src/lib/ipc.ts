@@ -67,6 +67,7 @@ let mockSettings: UserPreferences = {
     formal: '输出适合工作沟通与邮件场景的正式表达，不扩写事实。',
   },
   customStylePrompts: { raw: '', light: '', structured: '', formal: '' },
+  polishUniversalDirectives: '',
   launchAtLogin: false,
   showCapsule: true,
   muteDuringRecording: false,

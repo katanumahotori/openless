@@ -520,6 +520,13 @@ pub struct UserPreferences {
     pub style_system_prompts: StyleSystemPrompts,
     #[serde(default)]
     pub custom_style_prompts: CustomStylePrompts,
+    /// 全スタイル共通で常に上乗せされるユーザー指示（旧 universal directives）。
+    /// アクティブなスタイルパックの prompt の末尾に追記され、どのスタイルを
+    /// 選んでも効く。空文字 = 無効。タイポグラフィ（全角約物）は正規化器が
+    /// 別途強制するので、ここには語調・固有名詞・方針など prompt 寄りの共通
+    /// ルールを書く想定。
+    #[serde(default)]
+    pub polish_universal_directives: String,
     pub launch_at_login: bool,
     pub show_capsule: bool,
     /// 录音期间临时静音系统输出，停止/取消/出错后恢复原静音状态。
@@ -741,6 +748,8 @@ struct UserPreferencesWire {
     style_system_prompts: StyleSystemPrompts,
     #[serde(default)]
     custom_style_prompts: CustomStylePrompts,
+    #[serde(default)]
+    polish_universal_directives: String,
     launch_at_login: bool,
     show_capsule: bool,
     #[serde(default)]
@@ -819,6 +828,7 @@ impl Default for UserPreferencesWire {
             active_style_pack_id: Some(prefs.active_style_pack_id),
             style_system_prompts: prefs.style_system_prompts,
             custom_style_prompts: prefs.custom_style_prompts,
+            polish_universal_directives: prefs.polish_universal_directives,
             launch_at_login: prefs.launch_at_login,
             show_capsule: prefs.show_capsule,
             mute_during_recording: prefs.mute_during_recording,
@@ -894,6 +904,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
                 .style_system_prompts
                 .with_legacy_custom_prompts(&wire.custom_style_prompts),
             custom_style_prompts: wire.custom_style_prompts,
+            polish_universal_directives: wire.polish_universal_directives,
             launch_at_login: wire.launch_at_login,
             show_capsule: wire.show_capsule,
             mute_during_recording: wire.mute_during_recording,
@@ -1581,6 +1592,7 @@ impl Default for UserPreferences {
             active_style_pack_id: default_active_style_pack_id(),
             style_system_prompts: StyleSystemPrompts::default(),
             custom_style_prompts: CustomStylePrompts::default(),
+            polish_universal_directives: String::new(),
             launch_at_login: false,
             show_capsule: true,
             mute_during_recording: false,

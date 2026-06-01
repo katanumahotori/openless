@@ -121,8 +121,23 @@ function sanitizeZipFileName(name: string) {
 
 export function Style() {
   const { t } = useTranslation();
-  const { prefs: marketplacePrefs } = useHotkeySettings();
+  const { prefs: marketplacePrefs, updatePrefs } = useHotkeySettings();
   const canPublish = (marketplacePrefs?.marketplaceDevLogin ?? '').trim().length > 0;
+
+  // 全スタイル共通の常時プロンプト（旧 universal directives）。prefs と同期する
+  // ローカル下書き。フォーカスを外した時に updatePrefs で保存する。
+  const [universalDraft, setUniversalDraft] = useState('');
+  const [universalSaved, setUniversalSaved] = useState(false);
+  useEffect(() => {
+    setUniversalDraft(marketplacePrefs?.polishUniversalDirectives ?? '');
+  }, [marketplacePrefs?.polishUniversalDirectives]);
+  const saveUniversal = async () => {
+    const next = universalDraft;
+    if ((marketplacePrefs?.polishUniversalDirectives ?? '') === next) return;
+    await updatePrefs(current => ({ ...current, polishUniversalDirectives: next }));
+    setUniversalSaved(true);
+    window.setTimeout(() => setUniversalSaved(false), 2000);
+  };
 
   const [packs, setPacks] = useState<StylePack[]>([]);
 
@@ -536,6 +551,46 @@ export function Style() {
           </div>
         )}
       />
+
+      {/* 全スタイル共通の常時プロンプト（旧 universal directives）。
+          どのスタイルを選んでも整形時に必ず上乗せされる。 */}
+      <div
+        style={{
+          margin: '0 18px 16px',
+          padding: 16,
+          borderRadius: 12,
+          background: 'rgba(255,255,255,0.04)',
+          border: '1px solid rgba(255,255,255,0.08)',
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>全スタイル共通の指示（常に適用）</div>
+        <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 8, lineHeight: 1.6 }}>
+          ここに書いた内容は、どのスタイルを選んでも整形時に必ず上乗せされます（語調・固有名詞の表記・方針など）。句読点や全角約物は自動で整うので書かなくて大丈夫です。空欄なら無効。
+        </div>
+        <textarea
+          value={universalDraft}
+          onChange={e => setUniversalDraft(e.target.value)}
+          onBlur={() => void saveUniversal()}
+          placeholder="例：一人称は「私」で統一。固有名詞は無理に言い換えない。"
+          rows={5}
+          className="ol-thinscroll"
+          style={{
+            width: '100%',
+            resize: 'vertical',
+            padding: 10,
+            borderRadius: 8,
+            fontSize: 13,
+            lineHeight: 1.6,
+            background: 'rgba(0,0,0,0.2)',
+            color: 'inherit',
+            border: '1px solid rgba(255,255,255,0.12)',
+            boxSizing: 'border-box',
+          }}
+        />
+        <div style={{ height: 18, marginTop: 4, fontSize: 12, color: '#7ee787' }}>
+          {universalSaved ? '保存しました' : ''}
+        </div>
+      </div>
 
       {/* 控制台卡右上角锚定 —— 与「风格市场 / 刷新 / 导入 ZIP」按钮同区；
           淡蓝 pill 只闪现 0.8s，不长期遮挡按钮。 */}

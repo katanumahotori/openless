@@ -894,7 +894,11 @@ impl Coordinator {
             .style_packs
             .get_or_default_active(&prefs.active_style_pack_id)
             .map_err(|e| e.to_string())?;
-        let style_system_prompt = pack.prompt.clone();
+        let style_system_prompt = effective_style_prompt(
+            &pack.prompt,
+            pack.base_mode,
+            &prefs.polish_universal_directives,
+        );
         let working_languages = prefs.working_languages;
         let chinese_script_preference = prefs.chinese_script_preference;
         let output_language_preference = prefs.output_language_preference;
@@ -997,6 +1001,30 @@ fn raw_style_pack_uses_llm(pack: &crate::types::StylePack) -> bool {
 
 fn raw_mode_uses_llm(style_system_prompt: &str) -> bool {
     style_system_prompt != crate::types::StyleSystemPrompts::default().raw
+}
+
+/// アクティブなスタイルパックの prompt に、全スタイル共通の常時プロンプト
+/// （旧 universal directives）を上乗せして実効システムプロンプトを作る。
+///
+/// - `directives` が空なら何もしない（パックの prompt そのまま）。
+/// - Raw ベースのパックには上乗せしない：Raw の no-LLM 高速経路（prompt が
+///   既定 raw と一致するなら LLM を呼ばない）を壊さないため。整形系（light /
+///   structured / formal）のときだけ末尾に追記する。
+/// - 句読点・全角は正規化器が別途強制するので、ここはあくまで語調・固有名詞・
+///   方針など prompt 寄りの共通ルール用。
+pub(super) fn effective_style_prompt(
+    pack_prompt: &str,
+    base_mode: PolishMode,
+    directives: &str,
+) -> String {
+    let d = directives.trim();
+    if d.is_empty() || base_mode == PolishMode::Raw {
+        return pack_prompt.to_string();
+    }
+    format!(
+        "{}\n\n# 常に従う追加ルール（全スタイル共通・ユーザー設定）\n{}",
+        pack_prompt, d
+    )
 }
 
 // ─────────────────────────── hotkey bridging ───────────────────────────

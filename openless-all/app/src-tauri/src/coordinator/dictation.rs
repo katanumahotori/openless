@@ -1432,7 +1432,11 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     let chinese_script_preference = prefs.chinese_script_preference;
     let output_language_preference = prefs.output_language_preference;
     let llm_thinking_enabled = prefs.llm_thinking_enabled;
-    let style_system_prompt = pack.prompt.clone();
+    let style_system_prompt = super::effective_style_prompt(
+        &pack.prompt,
+        pack.base_mode,
+        &prefs.polish_universal_directives,
+    );
     let raw_uses_llm = mode == PolishMode::Raw && super::raw_style_pack_uses_llm(&pack);
     let translation_target = prefs.translation_target_language.trim().to_string();
     let translation_active =

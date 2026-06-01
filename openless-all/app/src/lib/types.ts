@@ -214,6 +214,8 @@ export interface UserPreferences {
   activeStylePackId: string;
   styleSystemPrompts: StyleSystemPrompts;
   customStylePrompts: CustomStylePrompts;
+  /** 全スタイル共通で常に上乗せされる指示（旧 universal directives）。 */
+  polishUniversalDirectives: string;
   launchAtLogin: boolean;
   showCapsule: boolean;
   /** 录音期间临时静音系统输出，停止/取消/出错后恢复原静音状态。 */

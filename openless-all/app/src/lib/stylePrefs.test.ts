@@ -28,6 +28,7 @@ const previousPrefs: UserPreferences = {
     formal: 'formal system prompt',
   },
   customStylePrompts: { raw: '', light: '', structured: '', formal: '' },
+  polishUniversalDirectives: '',
   launchAtLogin: false,
   showCapsule: true,
   muteDuringRecording: false,
