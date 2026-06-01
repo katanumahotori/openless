@@ -52,8 +52,8 @@ assertEqual(winErrorLayout.lineClamp, 2, 'windows error message allows two lines
 assertEqual(winErrorLayout.allowWrap, true, 'windows error message wraps');
 
 const winProcessingLayout = getCapsuleMessageLayout('win', 'processing');
-assertEqual(winProcessingLayout.lineClamp, 2, 'windows processing label allows two lines');
-assertEqual(winProcessingLayout.allowWrap, true, 'windows processing label wraps');
+assertEqual(winProcessingLayout.lineClamp, 1, 'windows processing label stays single-line');
+assertEqual(winProcessingLayout.allowWrap, false, 'windows processing label does not wrap');
 
 const macErrorLayout = getCapsuleMessageLayout('mac', 'error');
 assertEqual(macErrorLayout.lineClamp, 1, 'mac error message stays single-line');

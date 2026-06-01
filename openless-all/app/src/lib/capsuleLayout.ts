@@ -65,7 +65,10 @@ export function getCapsuleMessageLayout(
   os: OS,
   kind: CapsuleMessageKind,
 ): CapsuleMessageLayout {
-  if (os === 'win' && (kind === 'error' || kind === 'processing')) {
+  // エラー文言は長くなりうるので 2 行許可。整形中ラベル（processing）は短い
+  // 固定文言なので 1 行固定（折り返し禁止）にして、狭いテキストスロットでも
+  // 2 行に割れないようにする。
+  if (os === 'win' && kind === 'error') {
     return { allowWrap: true, lineClamp: 2 };
   }
 
