@@ -30,6 +30,10 @@ pub struct WhisperBatchASR {
     prompt: Option<String>,
     /// OpenAI 互換でもファイル長に上限がある provider 用。None は従来通り一括送信。
     max_chunk_duration_ms: Option<u64>,
+    /// `response_format=verbose_json` を要求してセグメントのメタデータで幻聴を
+    /// 捨てるか。OpenAI / Groq の Whisper のみ true。SiliconFlow（SenseVoice /
+    /// TeleSpeech）は response_format 非対応なので false で従来の json を送る。
+    verbose_json: bool,
     buffer: Mutex<Vec<u8>>,
 }
 
@@ -40,6 +44,7 @@ impl WhisperBatchASR {
         model: String,
         prompt: Option<String>,
         max_chunk_duration_ms: Option<u64>,
+        verbose_json: bool,
     ) -> Self {
         Self {
             api_key,
@@ -47,6 +52,7 @@ impl WhisperBatchASR {
             model,
             prompt,
             max_chunk_duration_ms,
+            verbose_json,
             buffer: Mutex::new(Vec::new()),
         }
     }
@@ -109,14 +115,18 @@ impl WhisperBatchASR {
             .context("set MIME type")?;
         let mut form = reqwest::multipart::Form::new()
             .part("file", wav_part)
-            .text("model", self.model.clone())
-            // verbose_json でセグメント単位のメタデータ（no_speech_prob /
-            // avg_logprob / compression_ratio）を取得する。これを使って
-            // Whisper の幻聴（無音・ノイズ区間での作話）セグメントを捨てる。
-            .text("response_format", "verbose_json")
-            // 文字起こしは決定論的タスク。temperature を明示 0 にして
-            // ランダムな作話の余地を減らす。
-            .text("temperature", "0");
+            .text("model", self.model.clone());
+
+        // verbose_json 対応プロバイダ（OpenAI / Groq）のときだけ要求する。
+        // セグメント単位のメタデータ（no_speech_prob / avg_logprob /
+        // compression_ratio）で幻聴を捨てるため。temperature も 0 固定。
+        // 非対応（SiliconFlow の SenseVoice / TeleSpeech 等）には送らず、
+        // 未知パラメータでの 4xx を避ける。
+        if self.verbose_json {
+            form = form
+                .text("response_format", "verbose_json")
+                .text("temperature", "0");
+        }
 
         // `prompt` は空文字を送らない：OpenAI 互換実装によっては空文字でエラーに
         // なるリスクがある（Groq は許容するが防御的にスキップ）。`trim()` で
@@ -144,7 +154,13 @@ impl WhisperBatchASR {
         }
 
         let json: serde_json::Value = resp.json().await.context("parse Whisper response")?;
-        let text = extract_confident_text(&json);
+        // verbose_json のときだけセグメントメタデータで幻聴を除去。非対応
+        // プロバイダは従来どおり text をそのまま使う。
+        let text = if self.verbose_json {
+            extract_confident_text(&json)
+        } else {
+            json["text"].as_str().unwrap_or("").trim().to_string()
+        };
         // 辞書プロンプトの echo（ユーザーが言っていない辞書語の羅列）を除去。
         let text = strip_prompt_echo(&text, self.prompt.as_deref());
         Ok(text)
@@ -779,8 +795,14 @@ mod tests {
     #[tokio::test]
     async fn transcribe_posts_single_request_without_chunk_limit() {
         let (base_url, server) = start_whisper_test_server(vec!["one"]);
-        let asr =
-            WhisperBatchASR::new("key".to_string(), base_url, "model".to_string(), None, None);
+        let asr = WhisperBatchASR::new(
+            "key".to_string(),
+            base_url,
+            "model".to_string(),
+            None,
+            None,
+            false,
+        );
         let pcm = vec![0u8; 32_000 * 65];
         asr.consume_pcm_chunk(&pcm);
 
@@ -800,6 +822,7 @@ mod tests {
             "model".to_string(),
             None,
             Some(30_000),
+            false,
         );
         let pcm = vec![0u8; 32_000 * 65];
         asr.consume_pcm_chunk(&pcm);

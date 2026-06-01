@@ -2373,6 +2373,19 @@ fn is_whisper_compatible_provider(id: &str) -> bool {
     matches!(id, "whisper" | "siliconflow" | "zhipu" | "groq")
 }
 
+/// このプロバイダの `/audio/transcriptions` が `response_format=verbose_json`
+/// に対応し、幻聴フィルタ用のセグメントメタデータ（no_speech_prob /
+/// avg_logprob / compression_ratio）を返すか。
+///
+/// - whisper(OpenAI) / groq … ネイティブ Whisper。完全対応＝フィルタ有効。
+/// - siliconflow … SenseVoice / TeleSpeech。response_format 非対応のため送ると
+///   4xx の懸念。従来の json のまま（false）。
+/// - zhipu(GLM-ASR) … verbose_json は受け付けるが上記指標を返さない（フィルタ
+///   空転）。挙動変更を最小化するため false にして json のまま。
+fn whisper_supports_verbose_json(provider_id: &str) -> bool {
+    matches!(provider_id, "whisper" | "groq")
+}
+
 fn is_bailian_provider(id: &str) -> bool {
     id == crate::asr::bailian::PROVIDER_ID
 }
@@ -4287,6 +4300,7 @@ mod tests {
             "model".to_string(),
             None,
             None,
+            false,
         ));
         *coordinator.inner.asr.lock() = Some(SessionResource::new(
             session_id(2),
