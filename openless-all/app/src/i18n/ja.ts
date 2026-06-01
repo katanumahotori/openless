@@ -32,7 +32,7 @@ export const ja: typeof zhCN = {
     durationMinutes: '{{value}} 分',
   },
   capsule: {
-    thinking: 'thinking',
+    thinking: '整形中…',
     cancelled: 'キャンセルしました',
     error: 'エラーが発生しました',
     inserted: '{{count}} 文字を入力しました',

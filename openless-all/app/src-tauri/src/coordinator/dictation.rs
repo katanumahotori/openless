@@ -442,18 +442,20 @@ fn streaming_insert_eligible(
 
 fn default_done_message(status: InsertStatus, polish_failed: bool) -> Option<String> {
     if polish_failed {
-        // polish 失败优先告知用户，即使 insert 成功也要让用户知道这版是原文
-        Some("润色失败，已插入原文".to_string())
+        // 整形に失敗しても原文は挿入済み、とユーザーに知らせる（日本語）。
+        Some("整形に失敗。原文を挿入しました".to_string())
     } else {
         match status {
-            InsertStatus::Inserted => None,
-            InsertStatus::PasteSent => Some("已尝试粘贴".to_string()),
+            // 通常成功（TSF 直接挿入 / クリップボード貼り付け）はメッセージ無し。
+            // カプセルは i18n の「N 文字を入力しました」を表示する。中国語の
+            // 「已尝试粘贴」が毎回出ていたのをやめ、Inserted と同じ扱いにする。
+            InsertStatus::Inserted | InsertStatus::PasteSent => None,
             InsertStatus::CopiedFallback => Some(if cfg!(target_os = "windows") {
-                "已复制，请 Ctrl+V".to_string()
+                "コピーしました。Ctrl+V で貼り付けてください".to_string()
             } else {
-                "已复制，请粘贴".to_string()
+                "コピーしました。貼り付けてください".to_string()
             }),
-            InsertStatus::Failed => Some("插入失败".to_string()),
+            InsertStatus::Failed => Some("挿入に失敗しました".to_string()),
         }
     }
 }
@@ -1930,13 +1932,11 @@ mod tests {
 
     #[test]
     fn default_done_message_works_correctly() {
-        assert_eq!(
-            default_done_message(InsertStatus::PasteSent, false),
-            Some("已尝试粘贴".to_string())
-        );
+        assert_eq!(default_done_message(InsertStatus::PasteSent, false), None);
+        assert_eq!(default_done_message(InsertStatus::Inserted, false), None);
         assert_eq!(
             default_done_message(InsertStatus::Inserted, true),
-            Some("润色失败，已插入原文".to_string())
+            Some("整形に失敗。原文を挿入しました".to_string())
         );
     }
 
