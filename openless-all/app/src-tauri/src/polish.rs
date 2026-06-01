@@ -2048,6 +2048,84 @@ fn normalize_japanese_punctuation(text: &str) -> String {
     out
 }
 
+/// ストリーミング挿入用の日本語正規化器。
+///
+/// バッチ版 `normalize_japanese_punctuation` と **完全に同じ出力** を、文字が
+/// 流れてくるたびに「もう変化しないと確定した分だけ」逐次返す。これにより
+/// ストリーミングの速さ（生成しながら画面に出る）と、正規化の 100% 保証
+/// （全角約物・！？後の全角スペース・余分スペース除去）を両立する。
+///
+/// 仕組み：正規化は前後 1 文字に依存するので、現在の raw 末尾に「次に来る
+/// 文字の代表（英数字／日本語／空白／閉じ括弧／改行／無し）」をそれぞれ仮に
+/// 付けて正規化し、その **共通プレフィックス** を「未来に何が来ても変わらない
+/// 確定部分」とみなして出力する。未確定の末尾は次の delta まで保留。バッチ版を
+/// そのまま呼ぶので、確定した断片を全部つなげると `normalize_japanese_
+/// punctuation(全 raw)` と一致する。
+pub(crate) struct StreamingJaNormalizer {
+    raw: String,
+    /// すでに呼び出し側へ返した正規化済み文字数。
+    emitted: usize,
+}
+
+impl StreamingJaNormalizer {
+    pub fn new() -> Self {
+        Self {
+            raw: String::new(),
+            emitted: 0,
+        }
+    }
+
+    /// raw に `delta` を足し、新たに確定した正規化済みの増分を返す。
+    pub fn push(&mut self, delta: &str) -> String {
+        self.raw.push_str(delta);
+        let stable = self.stable_normalized_prefix();
+        self.emit_from(&stable)
+    }
+
+    /// 末尾まで確定させ、保留していた残りを返す（ストリーム終了時に 1 回呼ぶ）。
+    pub fn finish(&mut self) -> String {
+        let full = normalize_japanese_punctuation(&self.raw);
+        self.emit_from(&full)
+    }
+
+    /// `normalized` のうち、まだ返していない後ろの部分を返して emitted を進める。
+    fn emit_from(&mut self, normalized: &str) -> String {
+        let chars: Vec<char> = normalized.chars().collect();
+        if chars.len() <= self.emitted {
+            return String::new();
+        }
+        let out: String = chars[self.emitted..].iter().collect();
+        self.emitted = chars.len();
+        out
+    }
+
+    /// 現在の raw について「未来に何が来ても変わらない」正規化プレフィックス。
+    /// raw 末尾に各種の次文字を仮付けして正規化し、その共通プレフィックスを取る。
+    fn stable_normalized_prefix(&self) -> String {
+        // 次文字の決定分岐を網羅する代表集合：
+        // ""=末尾, "a"=ASCII英数字, "あ"=日本語(継続), " "=空白, "」"=閉じ括弧, "\n"=改行。
+        const FUTURES: [&str; 6] = ["", "a", "あ", " ", "」", "\n"];
+        let mut common: Option<Vec<char>> = None;
+        for f in FUTURES {
+            let mut probe = self.raw.clone();
+            probe.push_str(f);
+            let norm: Vec<char> = normalize_japanese_punctuation(&probe).chars().collect();
+            common = Some(match common {
+                None => norm,
+                Some(prev) => {
+                    let n = prev
+                        .iter()
+                        .zip(norm.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    prev[..n].to_vec()
+                }
+            });
+        }
+        common.unwrap_or_default().into_iter().collect()
+    }
+}
+
 /// Strip model reasoning blocks so only the final polished text is inserted.
 ///
 /// Thinking-capable OpenAI-compatible models commonly return their reasoning in
@@ -2877,6 +2955,50 @@ mod tests {
             normalize_japanese_punctuation("すごい！　本当に"),
             "すごい！　本当に"
         );
+    }
+
+    /// 任意の分割で StreamingJaNormalizer に流し込んで、確定断片を全部つなげた
+    /// 結果がバッチ版 normalize_japanese_punctuation と一致することを確認する。
+    fn assert_streaming_matches_batch(input: &str, chunk_size: usize) {
+        let expected = normalize_japanese_punctuation(input);
+        let mut norm = StreamingJaNormalizer::new();
+        let mut got = String::new();
+        let chars: Vec<char> = input.chars().collect();
+        for piece in chars.chunks(chunk_size.max(1)) {
+            let s: String = piece.iter().collect();
+            got.push_str(&norm.push(&s));
+        }
+        got.push_str(&norm.finish());
+        assert_eq!(
+            got, expected,
+            "streaming != batch for input={input:?} chunk_size={chunk_size}"
+        );
+    }
+
+    #[test]
+    fn streaming_normalizer_matches_batch_various_inputs_and_chunkings() {
+        let cases = [
+            "これはすごい.やったね",
+            "そうだね,たぶん",
+            "進捗.md ですよ",
+            "3.14 と 1,000円",
+            "すごい!本当に?やった",
+            "やった! すごい",
+            "やったね!",
+            "「すごい!」と言った",
+            "入ってるね。 今使ってる",
+            "完了です。　次の話",
+            "これは　テスト",
+            "this is a test",
+            "config.json を読む",
+            "あと、作品設計ブートキャンプの感想特典ページを見ればわかるか?",
+        ];
+        // 1 文字ずつ / 2 文字ずつ / 3 文字ずつ / まとめて、どの分割でも一致。
+        for input in cases {
+            for chunk in [1usize, 2, 3, 100] {
+                assert_streaming_matches_batch(input, chunk);
+            }
+        }
     }
 
     #[test]

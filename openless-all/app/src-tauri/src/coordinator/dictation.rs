@@ -118,8 +118,16 @@ async fn run_streaming_polish(
     });
 
     // 3. 调流式润色，on_delta 塞 mpsc；should_cancel 检查 dictation 取消旗。
+    // delta は typer に渡る前に StreamingJaNormalizer で逐次正規化する。
+    // on_delta は Fn なので Mutex で包む（SSE ループから順番に同期呼び出し
+    // されるだけで実競合はない）。確定した正規化済み断片だけを送る。
     let inner_for_cancel = Arc::clone(inner);
     let should_cancel = move || inner_for_cancel.state.lock().cancelled;
+    let normalizer = Arc::new(parking_lot::Mutex::new(
+        crate::polish::StreamingJaNormalizer::new(),
+    ));
+    let normalizer_for_delta = Arc::clone(&normalizer);
+    let tx_finish = tx.clone();
     let outcome = super::polish_or_passthrough_streaming(
         raw,
         mode,
@@ -132,13 +140,24 @@ async fn run_streaming_polish(
         front_app,
         prior_turns,
         move |delta: &str| {
-            let _ = tx.send(delta.to_string());
+            let chunk = normalizer_for_delta.lock().push(delta);
+            if !chunk.is_empty() {
+                let _ = tx.send(chunk);
+            }
         },
         should_cancel,
     )
     .await;
-    // tx 已经被 move 进 on_delta 闭包；闭包随 polish_or_passthrough_streaming 返回
-    // 而 drop，typer 那侧 blocking_recv 拿到 None 自然退出。
+    // ストリーム終了：正規化器に保留されている末尾を確定して送る。tx は on_delta
+    // 閉包と一緒に drop 済みだが、clone した tx_finish はまだ生きているので残りを
+    // 送れる。送り終えたら drop → typer の blocking_recv が None を受けて退出。
+    {
+        let remainder = normalizer.lock().finish();
+        if !remainder.is_empty() {
+            let _ = tx_finish.send(remainder);
+        }
+    }
+    drop(tx_finish);
 
     // 4. 等 typer 把缓冲 drain 完，拿到实际落字的全文 + 第一条失败原因。
     let (typed_text, typer_failure) = typer_handle.await.unwrap_or_else(|e| {
@@ -183,9 +202,13 @@ async fn run_streaming_polish(
             // 后续逻辑统统用 final_text，三处保持一致。
             // pr-agent #412 反馈 \"Clipboard Mismatch\"：之前先写 text 到剪贴板再
             // 决定 typer 是否中途失败，导致 Cmd+V 粘出用户屏幕上没见过的内容。
+            // typer は正規化済みの断片を打っているので、画面に出た内容＝
+            // `typed_text`（正規化済み全文）。成功時も raw な `text` ではなく
+            // typed_text を使い、画面 / 履歴 / クリップボードを正規化済みで一致
+            // させる（生の text を使うと Cmd+V で半角混じりが貼られて分岐する）。
             let (final_text, polish_err) = match typer_failure {
                 Some(e) => (typed_text, Some(format!("typing partially failed: {e}"))),
-                None => (text, None),
+                None => (typed_text, None),
             };
             // 把 final_text 写回剪贴板（默认 on，可关）。一次性路径天然走剪贴板，
             // 开关默认对齐一次性行为，让 Cmd+V 重复粘贴可用。
@@ -388,15 +411,14 @@ fn finalize_polished_text(
     }
 }
 
-/// このフォークでは日本語正規化（句読点の全角化・余分なスペース除去）を確実に
-/// 効かせるため、当面ストリーミング挿入を無効化し、一括整形（one-shot →
-/// clean_polish_output → normalize_japanese_punctuation）経路を使う。
+/// ストリーミング挿入を有効化するか。
 ///
-/// ストリーミングは文字を逐次キー入力で画面に落とすため、本家も
-/// apply_correction_rules 等の後処理をスキップしている（後から戻せない）。
-/// 日本語正規化も同じ理由でストリーミングと両立しない。1 文字先読みの
-/// ストリーミング対応正規化器を実装したら true に戻す。
-const STREAMING_INSERT_PORTED: bool = false;
+/// 以前は日本語正規化（句読点の全角化・余分スペース除去）がストリーミングと
+/// 両立しないため無効化していたが、`StreamingJaNormalizer`（1 文字先読みで
+/// バッチ版と同一出力を逐次返す）を実装したので有効化。typer に渡る前に
+/// delta を逐次正規化するため、ストリーミングの速さと正規化 100% 保証を両立
+/// できる。
+const STREAMING_INSERT_PORTED: bool = true;
 
 fn streaming_insert_eligible(
     streaming_insert_enabled: bool,
