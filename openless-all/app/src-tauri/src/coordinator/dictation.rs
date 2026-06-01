@@ -411,14 +411,22 @@ fn finalize_polished_text(
     }
 }
 
-/// ストリーミング挿入を有効化するか。
+/// ストリーミング挿入を有効化するか。**無効**。
 ///
-/// 以前は日本語正規化（句読点の全角化・余分スペース除去）がストリーミングと
-/// 両立しないため無効化していたが、`StreamingJaNormalizer`（1 文字先読みで
-/// バッチ版と同一出力を逐次返す）を実装したので有効化。typer に渡る前に
-/// delta を逐次正規化するため、ストリーミングの速さと正規化 100% 保証を両立
-/// できる。
-const STREAMING_INSERT_PORTED: bool = true;
+/// 試した結果、このフォーク（Windows + バッチ Whisper）では割に合わないため
+/// 無効化している：
+/// 1. 速くならない。OpenLess は録音停止後に全音声をまとめて文字起こしする
+///    バッチ ASR で、整形もその後。ストリーミングは「整形結果の出方（逐次 vs
+///    一括）」を変えるだけで、停止→文字起こし→整形の実待ち時間は縮まない。
+/// 2. Windows の SendInput 経路だと、小刻みな文字が順序崩れして画面に入る
+///    （文字数は合うのに並びが壊れる）。本家も pace/buffer SendInput で苦労
+///    している領域。
+///
+/// 一括整形（TSF 経由・clean_polish_output→正規化）の方がきれいで確実なので
+/// そちらを使う。`StreamingJaNormalizer`（バッチ版と同一出力を逐次返す実装）
+/// はテスト済みで残してあり、将来 ASR をストリーミング化する等で再挑戦する
+/// 余地はある。
+const STREAMING_INSERT_PORTED: bool = false;
 
 fn streaming_insert_eligible(
     streaming_insert_enabled: bool,
