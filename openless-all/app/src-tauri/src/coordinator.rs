@@ -38,7 +38,7 @@ use crate::persistence::{
 
 use crate::llm_gemini::{GeminiConfig, GeminiProvider};
 use crate::polish::{
-    ActiveLLMProvider, CodexOAuthConfig, CodexOAuthLLMProvider, OpenAICompatibleConfig,
+    ActiveLLMProvider, CodexOAuthConfig, CodexOAuthLLMProvider, LLMError, OpenAICompatibleConfig,
     OpenAICompatibleLLMProvider, CODEX_DEFAULT_MODEL, CODEX_OAUTH_PROVIDER_ID,
 };
 use crate::qa_hotkey::{QaHotkeyError, QaHotkeyEvent, QaHotkeyMonitor};
@@ -2481,6 +2481,140 @@ where
     }
 }
 
+/// 整形/翻訳 LLM のモデル自動フォールバック。
+///
+/// 無料枠のモデルは「1日あたりトークン上限（TPD）」に達すると HTTP 429 を返す。
+/// 429 が出たモデルはその UTC 日のあいだ「枯渇」扱いにし、次のモデルへ自動で
+/// 切り替える。UTC 日付が変わる（＝クォータがリセットされる）と枯渇マークも
+/// 自動で消えるため、翌日はメインモデルが再び最優先で使われる。
+mod model_fallback {
+    use parking_lot::Mutex;
+
+    struct State {
+        /// 枯渇マークが有効な UTC 日（エポックからの経過日数）。
+        day: i64,
+        /// この日に 429 を返したモデル ID。
+        exhausted: Vec<String>,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        day: 0,
+        exhausted: Vec::new(),
+    });
+
+    fn current_utc_day() -> i64 {
+        chrono::Utc::now().timestamp().div_euclid(86_400)
+    }
+
+    fn roll_day(state: &mut State) {
+        let today = current_utc_day();
+        if state.day != today {
+            state.day = today;
+            state.exhausted.clear();
+        }
+    }
+
+    /// `model` が今日すでに 429（クォータ枯渇）になっているか。
+    pub fn is_exhausted(model: &str) -> bool {
+        let mut state = STATE.lock();
+        roll_day(&mut state);
+        state.exhausted.iter().any(|m| m == model)
+    }
+
+    /// `model` を今日の枯渇モデルとして記録する。
+    pub fn mark_exhausted(model: &str) {
+        let mut state = STATE.lock();
+        roll_day(&mut state);
+        if !state.exhausted.iter().any(|m| m == model) {
+            state.exhausted.push(model.to_string());
+        }
+    }
+}
+
+/// LLM 呼び出し失敗の分類。フォールバック判断に使う。
+enum LlmFailure {
+    /// 429: 1日のトークン上限超過。次モデルへ切替＋枯渇マーク。
+    Quota,
+    /// 5xx（過負荷）/ 400・404（モデル廃止・不明モデル）/ 空応答。次モデルを
+    /// 試すが枯渇マークはしない。
+    Transient,
+    /// 認証エラー（401/403）等。別モデルを試しても直らないので即返す。
+    Fatal,
+}
+
+fn classify_llm_error(e: &LLMError) -> LlmFailure {
+    match e {
+        LLMError::InvalidResponse { status, .. } if *status == 429 => LlmFailure::Quota,
+        LLMError::InvalidResponse { status, .. }
+            if *status >= 500 || *status == 400 || *status == 404 =>
+        {
+            LlmFailure::Transient
+        }
+        // 整形結果が空。次モデルなら正しく返せる可能性があるので次へ。
+        LLMError::EmptyResponse => LlmFailure::Transient,
+        _ => LlmFailure::Fatal,
+    }
+}
+
+/// 整形/翻訳のフォールバック用モデルチェーンを組む。
+///
+/// 先頭は必ずユーザーが設定したモデル。後続は Groq 無料枠の予備モデルを
+/// **整形品質の高い順**に並べる。Groq 以外のプロバイダでは `[primary]` のみ
+/// （＝従来どおり予備なし）。
+///
+/// 順序の根拠：
+/// - `gpt-oss-20b` … 実績のある `gpt-oss-120b` と同系列。整形ルールの追従が
+///   近いと期待でき、最優先の予備。
+/// - `llama-3.3-70b-versatile` … 70B 汎用、非推論。指示追従が安定。
+/// - `qwen/qwen3-32b` … 推論モデルだが TPD 最大。最後の砦として残す。
+fn build_model_chain(primary: &str, base_url: &str) -> Vec<String> {
+    let mut chain = vec![primary.to_string()];
+    if base_url.contains("groq.com") {
+        for m in [
+            "openai/gpt-oss-20b",
+            "llama-3.3-70b-versatile",
+            "qwen/qwen3-32b",
+        ] {
+            if !chain.iter().any(|c| c == m) {
+                chain.push(m.to_string());
+            }
+        }
+    }
+    chain
+}
+
+/// 枯渇キャッシュを反映した「今回試すモデル順」を返す。今日ダメと分かっている
+/// モデルは除外する。全モデルが枯渇扱いなら（最後の望みとして）チェーン全体を
+/// 返す。
+fn models_to_try(chain: &[String]) -> Vec<&String> {
+    let active: Vec<&String> = chain
+        .iter()
+        .filter(|m| !model_fallback::is_exhausted(m.as_str()))
+        .collect();
+    if active.is_empty() {
+        chain.iter().collect()
+    } else {
+        active
+    }
+}
+
+/// OpenAI 互換プロバイダのフォールバック設定一式を読む。
+/// 返り値: `(provider_id, api_key, base_url, model_chain)`。
+fn openai_fallback_setup() -> anyhow::Result<(String, String, String, Vec<String>)> {
+    let active = CredentialsVault::get_active_llm();
+    let api_key = CredentialsVault::get(CredentialAccount::ArkApiKey)?.unwrap_or_default();
+    let model = CredentialsVault::get(CredentialAccount::ArkModelId)?
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "deepseek-v3-2".to_string());
+    let endpoint = resolve_ark_endpoint(&api_key)?;
+    let base_url = endpoint
+        .trim_end_matches("/chat/completions")
+        .trim_end_matches('/')
+        .to_string();
+    let chain = build_model_chain(&model, &base_url);
+    Ok((active, api_key, base_url, chain))
+}
+
 async fn polish_or_passthrough(
     raw: &RawTranscript,
     mode: PolishMode,
@@ -2555,20 +2689,83 @@ async fn polish_text(
             .await?);
     }
 
-    let provider = build_active_llm_provider(llm_thinking_enabled)?;
-    Ok(provider
-        .polish(
-            raw,
-            mode,
-            hotwords,
-            style_system_prompt,
-            working_languages,
-            chinese_script_preference,
-            output_language_preference,
-            front_app,
-            prior_turns,
+    // Codex OAuth はモデル差し替えの概念が無い（OAuth トークン固定）ので
+    // フォールバックせず従来どおり 1 回呼ぶ。
+    if active_llm == CODEX_OAUTH_PROVIDER_ID {
+        let provider = build_active_llm_provider(llm_thinking_enabled)?;
+        return Ok(provider
+            .polish(
+                raw,
+                mode,
+                hotwords,
+                style_system_prompt,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                front_app,
+                prior_turns,
+            )
+            .await?);
+    }
+
+    // OpenAI 互換：モデルフォールバック（429/空応答/一時エラーで次モデルへ）。
+    let (provider_id, api_key, base_url, chain) = openai_fallback_setup()?;
+    let try_list = models_to_try(&chain);
+    let primary = chain.first().cloned().unwrap_or_default();
+    let mut last_err: Option<LLMError> = None;
+    for candidate in try_list {
+        let config = OpenAICompatibleConfig::new(
+            provider_id.clone(),
+            "OpenLess LLM",
+            base_url.clone(),
+            api_key.clone(),
+            candidate.clone(),
         )
-        .await?)
+        .with_thinking_enabled(llm_thinking_enabled);
+        let provider = OpenAICompatibleLLMProvider::new(config);
+        let result = provider
+            .polish(
+                raw,
+                mode.clone(),
+                hotwords,
+                style_system_prompt,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                front_app,
+                prior_turns,
+            )
+            .await;
+        match result {
+            Ok(s) => {
+                if candidate != &primary {
+                    log::warn!(
+                        "[coord] polish: メインモデル '{primary}' が使えないため予備モデル '{candidate}' で整形しました"
+                    );
+                }
+                return Ok(s);
+            }
+            Err(e) => match classify_llm_error(&e) {
+                LlmFailure::Quota => {
+                    log::warn!(
+                        "[coord] polish: モデル '{candidate}' がクォータ超過 (429)、次のモデルへ切替"
+                    );
+                    model_fallback::mark_exhausted(candidate);
+                    last_err = Some(e);
+                }
+                LlmFailure::Transient => {
+                    log::warn!(
+                        "[coord] polish: モデル '{candidate}' で一時的エラー ({e})、次のモデルへ切替"
+                    );
+                    last_err = Some(e);
+                }
+                LlmFailure::Fatal => return Err(e.into()),
+            },
+        }
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("polish failed: 利用可能なモデルがありません")))
 }
 
 /// 翻译路径——和 polish 一样失败时返回原文 + 失败原因，避免"不丢字"约定被违反（CLAUDE.md）。
@@ -2629,17 +2826,75 @@ async fn translate_text(
             .await?);
     }
 
-    let provider = build_active_llm_provider(llm_thinking_enabled)?;
-    Ok(provider
-        .translate_to(
-            raw,
-            target_language,
-            working_languages,
-            chinese_script_preference,
-            output_language_preference,
-            front_app,
+    if active_llm == CODEX_OAUTH_PROVIDER_ID {
+        let provider = build_active_llm_provider(llm_thinking_enabled)?;
+        return Ok(provider
+            .translate_to(
+                raw,
+                target_language,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                front_app,
+            )
+            .await?);
+    }
+
+    // OpenAI 互換：polish と同じモデルフォールバック。
+    let (provider_id, api_key, base_url, chain) = openai_fallback_setup()?;
+    let try_list = models_to_try(&chain);
+    let primary = chain.first().cloned().unwrap_or_default();
+    let mut last_err: Option<LLMError> = None;
+    for candidate in try_list {
+        let config = OpenAICompatibleConfig::new(
+            provider_id.clone(),
+            "OpenLess LLM",
+            base_url.clone(),
+            api_key.clone(),
+            candidate.clone(),
         )
-        .await?)
+        .with_thinking_enabled(llm_thinking_enabled);
+        let provider = OpenAICompatibleLLMProvider::new(config);
+        let result = provider
+            .translate_to(
+                raw,
+                target_language,
+                working_languages,
+                chinese_script_preference,
+                output_language_preference,
+                front_app,
+            )
+            .await;
+        match result {
+            Ok(s) => {
+                if candidate != &primary {
+                    log::warn!(
+                        "[coord] translate: メインモデル '{primary}' が使えないため予備モデル '{candidate}' で翻訳しました"
+                    );
+                }
+                return Ok(s);
+            }
+            Err(e) => match classify_llm_error(&e) {
+                LlmFailure::Quota => {
+                    log::warn!(
+                        "[coord] translate: モデル '{candidate}' がクォータ超過 (429)、次のモデルへ切替"
+                    );
+                    model_fallback::mark_exhausted(candidate);
+                    last_err = Some(e);
+                }
+                LlmFailure::Transient => {
+                    log::warn!(
+                        "[coord] translate: モデル '{candidate}' で一時的エラー ({e})、次のモデルへ切替"
+                    );
+                    last_err = Some(e);
+                }
+                LlmFailure::Fatal => return Err(e.into()),
+            },
+        }
+    }
+    Err(last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow::anyhow!("translate failed: 利用可能なモデルがありません")))
 }
 
 fn read_whisper_credentials() -> (String, String, String) {
@@ -4035,9 +4290,17 @@ fn enabled_phrases(inner: &Arc<Inner>) -> Vec<String> {
         .collect()
 }
 
-/// 终止态（Done / Cancelled / Error）后延迟 N ms 把胶囊改回 Idle，让浮窗自动消失。
-/// 用户点 ✕ / ✓ / 中途出错 / 按 Esc 都走这里，统一 2 秒。
+/// 终止态（主に Error）后延迟 N ms 把胶囊改回 Idle，让浮窗自动消失。
+/// エラー文言はユーザーが読む時間が要るので長め（2 秒）。
 const CAPSULE_AUTO_HIDE_DELAY_MS: u64 = 2000;
+
+/// 正常終止（Done）後の遅延（ms）。挿入は既に完了しているので確認用の浮窗は
+/// すぐ消す。エラーと違い読む情報が無いため短くてよい。
+const CAPSULE_DONE_HIDE_DELAY_MS: u64 = 200;
+
+/// キャンセル後の遅延（ms）。ユーザーが明示的に取り消した操作なので、確認の
+/// 猶予は不要。浮窗は即座に消す。
+const CAPSULE_CANCEL_HIDE_DELAY_MS: u64 = 0;
 
 /// Coordinator 全局超时保护：防止 ASR await_final_result() 永远挂起。
 /// 设置为 15 秒（比 ASR 的 12 秒 FINAL_RESULT_TIMEOUT 稍长），
@@ -4539,21 +4802,51 @@ struct CapsuleLayoutState {
     scale_bits: u64,
 }
 
-fn maybe_position_capsule_bottom_center<R: tauri::Runtime>(
-    inner: &Arc<Inner>,
+/// カプセルを配置すべきモニタの識別情報を返す。
+///
+/// `position_capsule_bottom_center` が実際に配置先を決めるのと **同じモニタ**
+/// を見る：Windows は入力中アプリの載るモニタ、その他は カプセル自身のモニタ。
+/// 再配置スキップ判定のキャッシュキーに使うため、ここがズレると「入力先が
+/// 別画面に移ったのに再配置されない」バグになる。
+fn capsule_layout_snapshot<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     translation_active: bool,
-) {
-    let Some(monitor) = window.current_monitor().ok().flatten() else {
-        return;
-    };
-    let next = CapsuleLayoutState {
+) -> Option<CapsuleLayoutState> {
+    // Windows: 入力中アプリの載るモニタを基準にする。カプセル自身の
+    // current_monitor を使うと、入力先が別画面に移ってもカプセルはまだ元の
+    // 画面にいる → 「変化なし」と誤判定して再配置がスキップされる。
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(mon) = crate::foreground_window_monitor() {
+            return Some(CapsuleLayoutState {
+                translation_active,
+                monitor_x: mon.left,
+                monitor_y: mon.top,
+                monitor_width: (mon.right - mon.left).max(0) as u32,
+                monitor_height: (mon.bottom - mon.top).max(0) as u32,
+                scale_bits: mon.scale.to_bits(),
+            });
+        }
+        // Win32 取得失敗時のみ下の current_monitor フォールバックへ。
+    }
+    let monitor = window.current_monitor().ok().flatten()?;
+    Some(CapsuleLayoutState {
         translation_active,
         monitor_x: monitor.position().x,
         monitor_y: monitor.position().y,
         monitor_width: monitor.size().width,
         monitor_height: monitor.size().height,
         scale_bits: monitor.scale_factor().to_bits(),
+    })
+}
+
+fn maybe_position_capsule_bottom_center<R: tauri::Runtime>(
+    inner: &Arc<Inner>,
+    window: &tauri::WebviewWindow<R>,
+    translation_active: bool,
+) {
+    let Some(next) = capsule_layout_snapshot(window, translation_active) else {
+        return;
     };
     {
         let last = inner.capsule_layout.lock();

@@ -1698,6 +1698,14 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         default_done_message(status, polish_error.is_some())
     };
 
+    // 純粋な成功（メッセージ無し）はすぐ消す。失敗通知（润色失败 等）が
+    // 載っているときはユーザーが読む時間を残す。
+    let done_hide_delay = if done_message.is_some() {
+        CAPSULE_AUTO_HIDE_DELAY_MS
+    } else {
+        CAPSULE_DONE_HIDE_DELAY_MS
+    };
+
     emit_capsule(
         inner,
         CapsuleState::Done,
@@ -1712,7 +1720,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         state.phase = SessionPhase::Idle;
         state.focus_target = None;
     }
-    schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+    schedule_capsule_idle(inner, done_hide_delay);
 
     Ok(())
 }
@@ -1762,7 +1770,7 @@ pub(super) fn cancel_session(inner: &Arc<Inner>) {
     }
     emit_capsule(inner, CapsuleState::Cancelled, 0.0, 0, None, None);
     log::info!("[coord] session cancelled (was {:?})", decision.phase);
-    schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+    schedule_capsule_idle(inner, CAPSULE_CANCEL_HIDE_DELAY_MS);
 }
 
 fn append_typed_prefix(target: &mut String, delta: &str, typed_chars: usize) -> usize {
