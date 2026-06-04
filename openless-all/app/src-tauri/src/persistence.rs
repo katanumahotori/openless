@@ -57,6 +57,25 @@ fn credentials_lock() -> &'static Mutex<()> {
     CREDENTIALS_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+#[cfg(test)]
+static TEST_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+fn test_data_dir() -> PathBuf {
+    TEST_DATA_DIR
+        .get_or_init(|| {
+            if let Some(dir) = std::env::var_os("OPENLESS_TEST_DATA_DIR") {
+                return PathBuf::from(dir);
+            }
+            std::env::temp_dir().join(format!(
+                "openless-test-data-{}-{}",
+                std::process::id(),
+                Uuid::new_v4()
+            ))
+        })
+        .clone()
+}
+
 /// Process-wide credentials cache.
 ///
 /// Without this cache every `CredentialsVault::get_*` / `snapshot` call hits
@@ -94,6 +113,12 @@ fn reset_credentials_cache_for_tests() {
 
 // ───────────────────────── path helpers ─────────────────────────
 
+#[cfg(test)]
+fn data_dir() -> Result<PathBuf> {
+    Ok(test_data_dir().join("OpenLess"))
+}
+
+#[cfg(not(test))]
 fn data_dir() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -479,6 +504,12 @@ impl CredsLlmEntry {
     }
 }
 
+#[cfg(test)]
+fn credentials_path() -> Result<PathBuf> {
+    Ok(test_data_dir().join("OpenLess").join(LEGACY_CREDS_FILE))
+}
+
+#[cfg(not(test))]
 fn credentials_path() -> Result<PathBuf> {
     // macOS / Linux: ~/.openless/credentials.json (与 Swift 同源)
     // Windows: %APPDATA%\OpenLess\credentials.json (Windows 没有标准 HOME 环境变量)
@@ -2273,6 +2304,26 @@ mod tests {
     use crate::types::{builtin_style_packs, CustomStylePrompts, VocabPreset, VocabPresetStore};
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn test_persistence_paths_are_isolated_from_real_user_data() {
+        let dir = super::data_dir().expect("test data dir");
+        assert!(dir.to_string_lossy().contains("openless-test-data-"));
+
+        #[cfg(target_os = "windows")]
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            assert!(!dir.starts_with(PathBuf::from(appdata).join("OpenLess")));
+        }
+
+        let prefs = super::PreferencesStore::new().expect("prefs store");
+        let style_packs = super::StylePackStore::new(&prefs).expect("style pack store");
+        assert!(prefs.path.starts_with(&dir));
+        assert!(style_packs.path.starts_with(&dir));
+        assert!(style_packs.asset_root.starts_with(&dir));
+
+        let legacy_credentials = super::credentials_path().expect("legacy creds path");
+        assert!(legacy_credentials.starts_with(&dir));
+    }
 
     #[test]
     fn credential_payload_chunks_stay_under_windows_blob_limit() {
