@@ -17,7 +17,9 @@ use tauri::{async_runtime, AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 #[cfg(target_os = "windows")]
-use crate::asr::local::{foundry, FoundryLocalRuntime, FoundryLocalWhisperAsr};
+use crate::asr::local::{
+    foundry, sherpa, FoundryLocalRuntime, FoundryLocalWhisperAsr, SherpaOnnxAsr, SherpaOnnxRuntime,
+};
 use crate::asr::{
     BailianCredentials, BailianRealtimeASR, DictionaryHotword, RawTranscript,
     VolcengineCredentials, VolcengineStreamingASR, WhisperBatchASR,
@@ -83,11 +85,11 @@ fn capsule_show_strategy_for_platform() -> CapsuleShowStrategy {
     // ⚠️ 如果改下面的 cfg 列表，**必须**同步更新单元测试
     // `capsule_show_strategy_matches_platform_activation_contract` 的两组 cfg —
     // 否则 Linux CI 直接红（PR #451 即是这种漏改）。
-    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         CapsuleShowStrategy::NoActivate
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         CapsuleShowStrategy::FallbackShow
     }
@@ -148,6 +150,9 @@ enum ActiveAsr {
     Bailian(Arc<BailianRealtimeASR>),
     #[cfg(target_os = "windows")]
     FoundryLocalWhisper(Arc<FoundryLocalWhisperAsr>),
+    /// Windows sherpa-onnx 本地 ASR（offline batch + 实验 online streaming）。
+    #[cfg(target_os = "windows")]
+    SherpaOnnxLocal(Arc<SherpaOnnxAsr>),
     /// 本地 Qwen3-ASR；只在 macOS + 模型已下载时可达。
     #[cfg(target_os = "macos")]
     Local(Arc<crate::asr::local::LocalQwenAsr>),
@@ -157,6 +162,10 @@ fn asr_transcribe_uses_global_timeout(asr: &ActiveAsr) -> bool {
     match asr {
         #[cfg(target_os = "windows")]
         ActiveAsr::FoundryLocalWhisper(_) => false,
+        // sherpa-onnx 首次加载 / 下载 / 推理的耗时类似 Foundry，不走
+        // COORDINATOR_GLOBAL_TIMEOUT；各 provider 自己里面控制細粒度超时。
+        #[cfg(target_os = "windows")]
+        ActiveAsr::SherpaOnnxLocal(_) => false,
         _ => true,
     }
 }
@@ -184,6 +193,11 @@ struct Inner {
     local_asr_cache: Arc<crate::asr::local::LocalAsrCache>,
     #[cfg(target_os = "windows")]
     foundry_local_runtime: Arc<FoundryLocalRuntime>,
+    /// Windows sherpa-onnx 本地 ASR runtime。与 Foundry 同处一个
+    /// 位置、同一 lifecycle 语义；上层通过 `ActiveAsr::SherpaOnnxLocal` 后只调
+    /// runtime，不会跨模块调。
+    #[cfg(target_os = "windows")]
+    sherpa_onnx_runtime: Arc<SherpaOnnxRuntime>,
     recorder: Mutex<Option<SessionResource<Recorder>>>,
     /// 当前 dictation / QA session 的 wav 归档是否真的被写到磁盘上。
     /// 由 Recorder::start 返回值 (archive_active) 写入；history.append 路径读取，
@@ -251,7 +265,10 @@ impl Coordinator {
     pub fn new() -> Self {
         #[cfg(target_os = "windows")]
         {
-            Self::new_with_foundry_runtime(Arc::new(FoundryLocalRuntime::new()))
+            Self::new_with_local_runtimes(
+                Arc::new(FoundryLocalRuntime::new()),
+                Arc::new(SherpaOnnxRuntime::new()),
+            )
         }
 
         #[cfg(not(target_os = "windows"))]
@@ -302,8 +319,19 @@ impl Coordinator {
         }
     }
 
+    /// 保留旧构造函数：现有调用点（含单元测试）只传 Foundry runtime。
+    /// sherpa-onnx runtime 这里创建默认 offline batch 实例；入产后（lib.rs）请走
+    /// `new_with_local_runtimes`，确保 Tauri State 共享同一个 Arc。
     #[cfg(target_os = "windows")]
     pub fn new_with_foundry_runtime(foundry_local_runtime: Arc<FoundryLocalRuntime>) -> Self {
+        Self::new_with_local_runtimes(foundry_local_runtime, Arc::new(SherpaOnnxRuntime::new()))
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn new_with_local_runtimes(
+        foundry_local_runtime: Arc<FoundryLocalRuntime>,
+        sherpa_onnx_runtime: Arc<SherpaOnnxRuntime>,
+    ) -> Self {
         let history = HistoryStore::new().unwrap_or_else(|e| {
             log::error!("[coord] HistoryStore init failed: {e}; falling back to empty");
             HistoryStore::new().expect("history store init")
@@ -347,6 +375,7 @@ impl Coordinator {
                 qa_stream_cancelled: Arc::new(AtomicBool::new(false)),
                 local_asr_cache: Arc::new(crate::asr::local::LocalAsrCache::new()),
                 foundry_local_runtime,
+                sherpa_onnx_runtime,
                 shutdown: AtomicBool::new(false),
             }),
         }
@@ -739,6 +768,16 @@ impl Coordinator {
     pub fn prefs(&self) -> &PreferencesStore {
         &self.inner.prefs
     }
+    pub fn sync_active_asr_provider_from_preferences(&self) -> Result<(), String> {
+        let provider = self.inner.prefs.get().active_asr_provider;
+        self.sync_active_asr_provider_to_vault(&provider)
+    }
+    pub fn sync_active_asr_provider_to_vault(&self, provider: &str) -> Result<(), String> {
+        if CredentialsVault::get_active_asr() == provider {
+            return Ok(());
+        }
+        CredentialsVault::set_active_asr_provider(provider).map_err(|e| e.to_string())
+    }
     pub fn style_packs(&self) -> &StylePackStore {
         &self.inner.style_packs
     }
@@ -801,7 +840,15 @@ impl Coordinator {
                 // Linux: 启动 fcitx5 插件信号监听作为热键源。
                 #[cfg(target_os = "linux")]
                 {
-                    crate::linux_fcitx::start_dictation_signal_listener(fcitx_tx);
+                    let (qa_trigger, translation_trigger) = modifier_shortcut_triggers(&self.inner);
+                    let custom_key = custom_dictation_key_string(&self.inner);
+                    crate::linux_fcitx::start_dictation_signal_listener(
+                        fcitx_tx,
+                        fcitx_binding.clone(),
+                        qa_trigger,
+                        translation_trigger,
+                        custom_key,
+                    );
                     if fcitx_binding.trigger == crate::types::HotkeyTrigger::Custom {
                         sync_custom_dictation_to_plugin(&self.inner);
                     } else {
@@ -1108,7 +1155,15 @@ fn hotkey_supervisor_loop(inner: Arc<Inner>) {
                 // Linux: 启动 fcitx5 插件信号监听作为热键源。
                 #[cfg(target_os = "linux")]
                 {
-                    crate::linux_fcitx::start_dictation_signal_listener(fcitx_tx);
+                    let (qa_trigger, translation_trigger) = modifier_shortcut_triggers(&inner);
+                    let custom_key = custom_dictation_key_string(&inner);
+                    crate::linux_fcitx::start_dictation_signal_listener(
+                        fcitx_tx,
+                        fcitx_binding.clone(),
+                        qa_trigger,
+                        translation_trigger,
+                        custom_key,
+                    );
                     if fcitx_binding.trigger == crate::types::HotkeyTrigger::Custom {
                         sync_custom_dictation_to_plugin(&inner);
                     } else {
@@ -1690,6 +1745,17 @@ fn is_builtin_translation_shift(binding: &crate::types::ShortcutBinding) -> bool
 
 /// Linux: 从 prefs 读取自定义组合键，同步到 fcitx5 插件。
 #[cfg(target_os = "linux")]
+fn custom_dictation_key_string(inner: &Arc<Inner>) -> Option<String> {
+    let prefs = inner.prefs.get();
+    let key_string = crate::linux_fcitx::binding_to_fcitx_key_string(&prefs.dictation_hotkey);
+    if key_string.is_empty() {
+        None
+    } else {
+        Some(key_string)
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn sync_custom_dictation_to_plugin(inner: &Arc<Inner>) {
     let prefs = inner.prefs.get();
     let dictation = &prefs.dictation_hotkey;
@@ -2248,6 +2314,17 @@ fn ensure_asr_credentials() -> Result<(), String> {
         }
     }
 
+    if crate::asr::local::sherpa::is_sherpa_onnx_local(&active_asr) {
+        #[cfg(not(target_os = "windows"))]
+        {
+            return Err("sherpa-onnx local ASR 当前仅支持 Windows".to_string());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            return Ok(());
+        }
+    }
+
     if is_whisper_compatible_provider(&active_asr) || is_bailian_provider(&active_asr) {
         let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
             .ok()
@@ -2275,6 +2352,7 @@ fn is_keyless_local_asr_provider(id: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
         crate::asr::local::foundry::is_foundry_local_whisper(id)
+            || crate::asr::local::sherpa::is_sherpa_onnx_local(id)
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -2343,6 +2421,31 @@ fn schedule_foundry_local_asr_release(inner: &Arc<Inner>, session_id: SessionId)
         }
         if let Err(error) = runtime.release_now().await {
             log::warn!("[foundry-asr] scheduled release failed: {error:#}");
+        }
+    });
+}
+
+#[cfg(target_os = "windows")]
+fn sherpa_onnx_release_keep_secs(inner: &Arc<Inner>) -> u32 {
+    inner.prefs.get().sherpa_onnx_keep_loaded_secs
+}
+
+/// 与 `schedule_foundry_local_asr_release` 同形：session_id 老旧则不释放，
+/// 避免下一轮 session 立即重加载同一个 offline batch 模型。
+#[cfg(target_os = "windows")]
+fn schedule_sherpa_onnx_release(inner: &Arc<Inner>, session_id: SessionId) {
+    let keep_secs = sherpa_onnx_release_keep_secs(inner);
+    let runtime = Arc::clone(&inner.sherpa_onnx_runtime);
+    let inner = Arc::clone(inner);
+    tauri::async_runtime::spawn(async move {
+        if keep_secs > 0 {
+            tokio::time::sleep(std::time::Duration::from_secs(keep_secs as u64)).await;
+        }
+        if !foundry_release_session_is_current(&inner, session_id) {
+            return;
+        }
+        if let Err(error) = runtime.release_now().await {
+            log::warn!("[sherpa-asr] scheduled release failed: {error:#}");
         }
     });
 }
@@ -3751,17 +3854,28 @@ mod tests {
     }
 
     #[test]
-    fn foundry_local_provider_is_keyless_and_not_whisper_compatible() {
+    fn windows_local_providers_are_keyless_and_not_whisper_compatible() {
         #[cfg(target_os = "windows")]
         assert!(is_keyless_local_asr_provider(
             crate::asr::local::foundry::PROVIDER_ID
+        ));
+        #[cfg(target_os = "windows")]
+        assert!(is_keyless_local_asr_provider(
+            crate::asr::local::sherpa::PROVIDER_ID
         ));
         #[cfg(not(target_os = "windows"))]
         assert!(!is_keyless_local_asr_provider(
             crate::asr::local::foundry::PROVIDER_ID
         ));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!is_keyless_local_asr_provider(
+            crate::asr::local::sherpa::PROVIDER_ID
+        ));
         assert!(!is_whisper_compatible_provider(
             crate::asr::local::foundry::PROVIDER_ID
+        ));
+        assert!(!is_whisper_compatible_provider(
+            crate::asr::local::sherpa::PROVIDER_ID
         ));
     }
 
@@ -4084,13 +4198,13 @@ mod tests {
         // 平台列表必须与 capsule_show_strategy_for_platform 的 cfg 完全一致：
         // 改实现里的 #[cfg] 时，一并改这两个 #[cfg]，否则 Linux CI 直接红
         // （fcitx5 PR #451 把 Linux 加进 NoActivate 但漏改本测试，CI 失败）。
-        #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         assert_eq!(
             capsule_show_strategy_for_platform(),
             CapsuleShowStrategy::NoActivate
         );
 
-        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         assert_eq!(
             capsule_show_strategy_for_platform(),
             CapsuleShowStrategy::FallbackShow
@@ -4376,6 +4490,13 @@ fn local_qwen_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
         .saturating_add(10)
         .max(COORDINATOR_GLOBAL_TIMEOUT_SECS);
     std::time::Duration::from_secs(secs)
+}
+
+/// sherpa-onnx offline batch 暂与 Foundry 同档；后续按 Windows 真机 CPU/模型
+/// 实测结果再调整。
+#[cfg(target_os = "windows")]
+fn sherpa_audio_transcribe_timeout_duration() -> std::time::Duration {
+    std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS)
 }
 
 /// 检查 begin_session 的 await 间隙是否被 cancel_session 打断。
@@ -4697,8 +4818,20 @@ fn show_capsule_window_no_activate<R: tauri::Runtime>(
 
     // emit_capsule 已经把窗口操作 marshal 到 Tauri 主线程；这里不能再调用
     // window.show()/set_focus()/NSApp.activate，否则 AeroSpace 会把 workspace 切回
-    // OpenLess 主窗口所在空间。orderFrontRegardless 只让胶囊可见，不成为 key window。
+    // OpenLess 主窗口所在空间。先让胶囊加入所有 Spaces，再用
+    // orderFrontRegardless 做无激活展示。
+    if let Err(e) = window.set_visible_on_all_workspaces(true) {
+        log::warn!("[capsule] set visible on all macOS Spaces failed: {e}");
+    }
+
     unsafe {
+        const NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES: usize = 1 << 0;
+        const NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY: usize = 1 << 8;
+        let behavior: usize = msg_send![ns_window, collectionBehavior];
+        let behavior = behavior
+            | NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+            | NS_WINDOW_COLLECTION_BEHAVIOR_FULL_SCREEN_AUXILIARY;
+        let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
         let _: () = msg_send![ns_window, orderFrontRegardless];
     }
     true
@@ -4709,8 +4842,6 @@ fn show_capsule_window_no_activate<R: tauri::Runtime>(
     _app: &AppHandle<R>,
     _window: &tauri::WebviewWindow<R>,
 ) -> bool {
-    // Linux/fcitx5: Wayland 上弹胶囊窗口会触发 workspace 跳转且无法可靠
-    // no-activate。返回 true 抑制胶囊窗口，不让 wrapper fallback 到 window.show()。
     true
 }
 
@@ -4782,6 +4913,86 @@ fn emit_capsule(
     // 必须在 call-site（即音频线程触发 emit_capsule 时）就算定，否则 main thread
     // 闭包里读到的将是「下一帧」的 state，跟实际下发给 JS 的 payload 不一致。
     let visible = !matches!(state, CapsuleState::Idle);
+
+    // Linux: 通过 fcitx5 插件在候选词列表下方显示听写状态，不干扰输入法预编辑。
+    // 只在文本变化时调用 DBus，避免录音中 ~30Hz 的音频电平回调重复调用。
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::Mutex;
+        static LAST_AUX: Mutex<Option<String>> = Mutex::new(None);
+
+        let aux = match state {
+            CapsuleState::Idle => None,
+            CapsuleState::Recording => Some("🎤 收音中..."),
+            CapsuleState::Transcribing => Some("🔄 识别中..."),
+            CapsuleState::Polishing => Some("✨ 润色中..."),
+            CapsuleState::Done => Some("✅ 已插入"),
+            CapsuleState::Cancelled => Some("— 已取消"),
+            CapsuleState::Error => Some("❌ 出错"),
+        };
+
+        let mut last = LAST_AUX.lock().unwrap();
+        if aux != last.as_deref() {
+            *last = aux.map(String::from);
+            // 代数计数器：每次状态变化 +1，retry 线程只在自己代数仍为最新时生效。
+            // 避免 Recording→Idle→Recording 快速切换时多个 retry 重复触发。
+            static RETRY_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            // fetch_add 返回旧值，所以 latest_gen > gen+1 才表示"在我之后又发生了变更"。
+            let gen = RETRY_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match aux {
+                Some(t) => {
+                    log::info!("[capsule] set_aux_down: {t} gen={gen}");
+                    let text = t.to_string();
+                    std::thread::spawn(move || {
+                        let current = LAST_AUX.lock().unwrap().clone();
+                        if current.as_deref() != Some(&text) {
+                            log::info!("[capsule] set_aux_down skipped: state changed to {current:?}");
+                            return;
+                        }
+                        if let Err(e) = crate::linux_fcitx::set_aux_down(&text) {
+                            log::warn!("[capsule] set_aux_down failed: {e}");
+                        }
+                    });
+                    // 终态（Done/Cancelled/Error）3 秒后自动清除，避免一直跟随焦点。
+                    if matches!(state, CapsuleState::Done | CapsuleState::Cancelled | CapsuleState::Error) {
+                        let text = t.to_string();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_secs(3));
+                            let latest_gen = RETRY_GEN.load(std::sync::atomic::Ordering::SeqCst);
+                            if latest_gen > gen + 1 {
+                                return;
+                            }
+                            let current = LAST_AUX.lock().unwrap().clone();
+                            if current.as_deref() != Some(&text) {
+                                return;
+                            }
+                            log::info!("[capsule] auto-clear terminal state: {text}");
+                            let _ = crate::linux_fcitx::set_aux_down("");
+                            *LAST_AUX.lock().unwrap() = None;
+                        });
+                    }
+                }
+                None => {
+                    log::info!("[capsule] clear_aux_down gen={gen}");
+                    std::thread::spawn(move || {
+                        let latest_gen = RETRY_GEN.load(std::sync::atomic::Ordering::SeqCst);
+                        if latest_gen > gen + 1 {
+                            log::info!("[capsule] clear_aux_down skipped: gen {gen}, latest {latest_gen}");
+                            return;
+                        }
+                        let current = LAST_AUX.lock().unwrap().clone();
+                        if current.is_some() {
+                            log::info!("[capsule] clear_aux_down skipped: state changed to {current:?}");
+                            return;
+                        }
+                        if let Err(e) = crate::linux_fcitx::clear_aux_down() {
+                            log::warn!("[capsule] clear_aux_down failed: {e}");
+                        }
+                    });
+                }
+            }
+        }
+    }
 
     // emit_capsule 会被 cpal process_callback（音频回调线程）调用 ~30 Hz —— 在该
     // 线程上调用 NSWindow / HWND API 会撞 macOS dispatch_assert_queue_fail SIGTRAP

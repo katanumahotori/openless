@@ -11,8 +11,17 @@ use crate::asr::local::foundry::{
     model_alias_is_known, FoundryCatalogModel, FoundryPrepareProgressPayload, FoundryRuntimeStatus,
     DEFAULT_MODEL_ALIAS, PROVIDER_ID as FOUNDRY_LOCAL_PROVIDER_ID,
 };
-use crate::asr::local::FoundryLocalRuntime;
+use crate::asr::local::sherpa::{
+    model_alias_is_known as sherpa_model_alias_is_known, SherpaCatalogModel,
+    SherpaPrepareProgressPayload, SherpaRuntimeStatus,
+    DEFAULT_MODEL_ALIAS as SHERPA_DEFAULT_MODEL_ALIAS,
+};
+use crate::asr::local::sherpa_download::{
+    fetch_remote_info as fetch_sherpa_remote_info, SherpaDownloadManager, SherpaRemoteInfo,
+};
+use crate::asr::local::{FoundryLocalRuntime, SherpaOnnxRuntime};
 use crate::coordinator::Coordinator;
+use crate::net;
 use crate::permissions::{self, PermissionStatus};
 use crate::persistence::{
     sync_style_pack_preferences, CredentialAccount, CredentialsSnapshot, CredentialsVault,
@@ -67,7 +76,9 @@ pub fn get_default_style_system_prompts() -> StyleSystemPrompts {
 }
 
 trait SettingsWriter {
+    fn read_settings(&self) -> UserPreferences;
     fn write_settings(&self, prefs: UserPreferences) -> Result<(), String>;
+    fn sync_active_asr_provider(&self, provider: &str) -> Result<(), String>;
     fn refresh_dictation_hotkey(&self);
     fn refresh_qa_hotkey(&self);
     fn refresh_combo_hotkey(&self);
@@ -77,8 +88,16 @@ trait SettingsWriter {
 }
 
 impl SettingsWriter for Coordinator {
+    fn read_settings(&self) -> UserPreferences {
+        self.prefs().get()
+    }
+
     fn write_settings(&self, prefs: UserPreferences) -> Result<(), String> {
         self.prefs().set(prefs).map_err(|e| e.to_string())
+    }
+
+    fn sync_active_asr_provider(&self, provider: &str) -> Result<(), String> {
+        self.sync_active_asr_provider_to_vault(provider)
     }
 
     fn refresh_dictation_hotkey(&self) {
@@ -107,8 +126,16 @@ impl SettingsWriter for Coordinator {
 }
 
 impl<T: SettingsWriter + ?Sized> SettingsWriter for Arc<T> {
+    fn read_settings(&self) -> UserPreferences {
+        (**self).read_settings()
+    }
+
     fn write_settings(&self, prefs: UserPreferences) -> Result<(), String> {
         (**self).write_settings(prefs)
+    }
+
+    fn sync_active_asr_provider(&self, provider: &str) -> Result<(), String> {
+        (**self).sync_active_asr_provider(provider)
     }
 
     fn refresh_dictation_hotkey(&self) {
@@ -140,15 +167,56 @@ fn persist_settings<T: SettingsWriter>(
     coord: &T,
     mut prefs: UserPreferences,
 ) -> Result<(), String> {
+    let mut previous = coord.read_settings();
+    sync_dictation_hotkey_legacy_fields(&mut previous);
     sync_dictation_hotkey_legacy_fields(&mut prefs);
     reject_hotkey_collisions(&prefs)?;
-    coord.write_settings(prefs)?;
-    coord.refresh_dictation_hotkey();
-    coord.refresh_qa_hotkey();
-    coord.refresh_combo_hotkey();
-    coord.refresh_translation_hotkey();
-    coord.refresh_switch_style_hotkey();
-    coord.refresh_open_app_hotkey();
+    let dictation_shortcut_changed = previous.dictation_hotkey != prefs.dictation_hotkey;
+    let dictation_mode_changed = previous.hotkey.mode != prefs.hotkey.mode;
+    let qa_changed = previous.qa_hotkey != prefs.qa_hotkey;
+    let translation_changed = previous.translation_hotkey != prefs.translation_hotkey;
+    let switch_style_changed = previous.switch_style_hotkey != prefs.switch_style_hotkey;
+    let open_app_changed = previous.open_app_hotkey != prefs.open_app_hotkey;
+    let active_asr_provider_changed = previous.active_asr_provider != prefs.active_asr_provider;
+    let active_asr_provider = prefs.active_asr_provider.clone();
+    if active_asr_provider_changed {
+        coord.sync_active_asr_provider(&active_asr_provider)?;
+    }
+    if let Err(error) = coord.write_settings(prefs.clone()) {
+        if active_asr_provider_changed {
+            if let Err(rollback_error) =
+                coord.sync_active_asr_provider(&previous.active_asr_provider)
+            {
+                coord.write_settings(prefs).map_err(|roll_forward_error| {
+                    format!(
+                        "{error}; additionally failed to restore active ASR provider: {rollback_error}; additionally failed to preserve active ASR provider consistency: {roll_forward_error}"
+                    )
+                })?;
+            } else {
+                return Err(error);
+            }
+        } else {
+            return Err(error);
+        }
+    }
+    if dictation_shortcut_changed || dictation_mode_changed {
+        coord.refresh_dictation_hotkey();
+    }
+    if dictation_shortcut_changed {
+        coord.refresh_combo_hotkey();
+    }
+    if qa_changed {
+        coord.refresh_qa_hotkey();
+    }
+    if translation_changed {
+        coord.refresh_translation_hotkey();
+    }
+    if switch_style_changed {
+        coord.refresh_switch_style_hotkey();
+    }
+    if open_app_changed {
+        coord.refresh_open_app_hotkey();
+    }
     Ok(())
 }
 
@@ -319,16 +387,13 @@ pub struct LatestBetaRelease {
 /// 返回 `Ok(None)` = 当前没发过 Beta 版；`Err(String)` = 网络/解析故障。
 #[tauri::command]
 pub async fn fetch_latest_beta_release() -> Result<Option<LatestBetaRelease>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .user_agent(concat!("OpenLess/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-    let resp = client
-        .get("https://github.com/appergb/openless/releases.atom")
-        .send()
-        .await
-        .map_err(|e| format!("fetch releases.atom: {e}"))?;
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .get("https://github.com/appergb/openless/releases.atom")
+            .timeout(std::time::Duration::from_secs(15))
+    })
+    .await
+    .map_err(|e| format!("fetch releases.atom: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("releases.atom status {}", resp.status()));
     }
@@ -408,17 +473,20 @@ pub struct AppUpdateMetadata {
     pub raw_json: serde_json::Value,
 }
 
-/// 按 prefs.update_channel 决定 manifest 来源，再走 plugin-updater 的标准 check 流程。
+/// 决定 manifest 来源后走 plugin-updater 的标准 check 流程。
+/// 渠道：显式传入 `channel` 时用它（关于页固定查 Stable、高级页 Beta 区查 Beta）；
+/// 不传则回落到 `prefs.update_channel`（后台 AutoUpdateGate 自动检查走这条）。
 /// 返回 None = 当前是最新；Some(metadata) = 有新版可装。
 #[tauri::command]
 pub async fn app_check_update_with_channel<R: tauri::Runtime>(
     coord: CoordinatorState<'_>,
     webview: tauri::Webview<R>,
     timeout_ms: Option<u64>,
+    channel: Option<UpdateChannel>,
 ) -> Result<Option<AppUpdateMetadata>, String> {
     use tauri_plugin_updater::UpdaterExt;
 
-    let channel = coord.prefs().get().update_channel;
+    let channel = channel.unwrap_or_else(|| coord.prefs().get().update_channel);
     let mut builder = webview.updater_builder();
     if let Some(ms) = timeout_ms {
         builder = builder.timeout(std::time::Duration::from_millis(ms));
@@ -483,27 +551,29 @@ pub struct NetworkCheckResult {
 
 #[tauri::command]
 pub async fn check_network() -> NetworkCheckResult {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build();
-    let client = match client {
-        Ok(c) => c,
-        Err(_) => return NetworkCheckResult { online: false, latency_ms: None },
-    };
+    // 探一个真实存在的接口。旧逻辑探 `/health` —— 实测返回 404，链路正常也永远判
+    // 离线；且用 HEAD（后端只挂 GET）。改成 GET `/packs`，拿到任意 HTTP 响应即算通。
+    //
+    // 单发、不走 send_with_retry：这是每 30s 跑一次的状态探针，要的是「快」。10 次
+    // 退避重试会让被过滤 / 黑洞的网络下探测拖到近一分钟、状态灯像卡死。偶发的瞬时
+    // 误判由下一个 30s 周期自动纠正。仍用 net::http() 共享连接池。
+    let url = format!("{MARKETPLACE_BASE_URL}/packs?limit=1");
     let start = std::time::Instant::now();
-    let endpoints = [
-        "https://apic.openless.top/health",
-        "https://github.com",
-    ];
-    for url in &endpoints {
-        if let Ok(resp) = client.head(*url).send().await {
-            if resp.status().is_success() || resp.status().is_redirection() {
-                let ms = start.elapsed().as_millis() as u64;
-                return NetworkCheckResult { online: true, latency_ms: Some(ms) };
-            }
-        }
+    match net::http()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Ok(_) => NetworkCheckResult {
+            online: true,
+            latency_ms: Some(start.elapsed().as_millis() as u64),
+        },
+        Err(_) => NetworkCheckResult {
+            online: false,
+            latency_ms: None,
+        },
     }
-    NetworkCheckResult { online: false, latency_ms: None }
 }
 
 #[tauri::command]
@@ -603,7 +673,10 @@ fn asr_configured_for_provider(provider: &str, snap: &CredentialsSnapshot) -> bo
     if provider == "volcengine" {
         return volcengine_configured(snap);
     }
-    if provider == crate::asr::local::PROVIDER_ID || active_foundry_asr_is_supported(provider) {
+    if provider == crate::asr::local::PROVIDER_ID
+        || active_foundry_asr_is_supported(provider)
+        || active_sherpa_asr_is_supported(provider)
+    {
         // 本地 ASR 不依赖云端凭据。
         return true;
     }
@@ -669,12 +742,14 @@ fn configured(field: &Option<String>) -> bool {
 struct LocalAsrReleasePlan {
     qwen: bool,
     foundry: bool,
+    sherpa: bool,
 }
 
 fn local_asr_release_plan_for_provider(provider: &str) -> LocalAsrReleasePlan {
     LocalAsrReleasePlan {
         qwen: provider != crate::asr::local::PROVIDER_ID,
         foundry: provider != FOUNDRY_LOCAL_PROVIDER_ID,
+        sherpa: provider != crate::asr::local::sherpa::PROVIDER_ID,
     }
 }
 
@@ -690,28 +765,46 @@ async fn release_foundry_runtime_if_inactive(
     }
 }
 
+async fn release_sherpa_runtime_if_inactive(
+    runtime: &Arc<SherpaOnnxRuntime>,
+    release_sherpa: bool,
+) {
+    if release_sherpa {
+        runtime.request_cancel_prepare();
+        if let Err(error) = runtime.release_now().await {
+            log::warn!("[sherpa-asr] release inactive runtime failed: {error:#}");
+        }
+    }
+}
+
 #[tauri::command]
 pub fn set_credential(window: Window, account: String, value: String) -> Result<(), String> {
     ensure_main_window(&window)?;
     let acc = parse_account(&account)?;
     if value.is_empty() {
-        CredentialsVault::remove(acc).map_err(|e| e.to_string())?;
+        CredentialsVault::remove(acc).map_err(|e| e.to_string())
     } else {
-        CredentialsVault::set(acc, &value).map_err(|e| e.to_string())?;
+        CredentialsVault::set(acc, &value).map_err(|e| e.to_string())
     }
-    // 通知前端凭据已变更（如 Overview 页需要刷新 asrConfigured 状态）。
-    let _ = window.emit("credentials:changed", ());
-    Ok(())
 }
 
 #[tauri::command]
 pub async fn set_active_asr_provider(
     coord: CoordinatorState<'_>,
     runtime: State<'_, Arc<FoundryLocalRuntime>>,
+    sherpa_runtime: State<'_, Arc<SherpaOnnxRuntime>>,
     provider: String,
 ) -> Result<(), String> {
     if provider == FOUNDRY_LOCAL_PROVIDER_ID && !active_foundry_asr_is_supported(&provider) {
         return Err("Foundry Local Whisper is only available on Windows".to_string());
+    }
+    if provider == crate::asr::local::sherpa::PROVIDER_ID
+        && !active_sherpa_asr_is_supported(&provider)
+    {
+        return Err("sherpa-onnx local ASR is only available on Windows".to_string());
+    }
+    if CredentialsVault::get_active_asr() == provider {
+        return Ok(());
     }
     CredentialsVault::set_active_asr_provider(&provider).map_err(|e| e.to_string())?;
     let release_plan = local_asr_release_plan_for_provider(&provider);
@@ -726,6 +819,7 @@ pub async fn set_active_asr_provider(
         coord.release_local_asr_engine();
     }
     release_foundry_runtime_if_inactive(runtime.inner(), release_plan.foundry).await;
+    release_sherpa_runtime_if_inactive(sherpa_runtime.inner(), release_plan.sherpa).await;
     Ok(())
 }
 
@@ -962,7 +1056,9 @@ async fn validate_bailian_asr_provider() -> Result<(), String> {
 }
 
 fn active_asr_is_keyless_for_validation(provider: &str) -> bool {
-    provider == crate::asr::local::PROVIDER_ID || active_foundry_asr_is_supported(provider)
+    provider == crate::asr::local::PROVIDER_ID
+        || active_foundry_asr_is_supported(provider)
+        || active_sherpa_asr_is_supported(provider)
 }
 
 fn active_foundry_asr_is_supported(provider: &str) -> bool {
@@ -977,33 +1073,55 @@ fn active_foundry_asr_is_supported(provider: &str) -> bool {
     }
 }
 
+fn active_sherpa_asr_is_supported(provider: &str) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        provider == crate::asr::local::sherpa::PROVIDER_ID
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = provider;
+        false
+    }
+}
+
 async fn validate_asr_transcription(config: &ProviderConfig, model: &str) -> Result<(), String> {
     const MAX_ASR_VALIDATE_BODY_BYTES: usize = 1024 * 1024;
+    const MAX_ATTEMPTS: u32 = 6;
     let url = asr_transcriptions_url(&config.base_url)?;
     let wav = encode_wav_16k_mono_silence(250);
-    let wav_part = reqwest::multipart::Part::bytes(wav)
-        .file_name("openless-asr-check.wav")
-        .mime_str("audio/wav")
-        .map_err(|e| format!("请求体构建失败: {e}"))?;
-    let form = reqwest::multipart::Form::new()
-        .part("file", wav_part)
-        .text("model", model.to_string());
     let client = http_client_builder(&url, 20)
         .build()
         .map_err(|_| "providerClientInitFailed".to_string())?;
-    let response = client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", config.api_key))
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "providerRequestTimeout".to_string()
-            } else {
-                "providerNetworkError".to_string()
+    // 连接 / 请求未送出类失败做指数退避重试 —— 这类失败请求尚未送达服务端，重试
+    // 安全。超时不重试（服务端可能已在处理）。multipart 是流式 body，每次重建。
+    let mut attempt: u32 = 0;
+    let response = loop {
+        attempt += 1;
+        let wav_part = reqwest::multipart::Part::bytes(wav.clone())
+            .file_name("openless-asr-check.wav")
+            .mime_str("audio/wav")
+            .map_err(|e| format!("请求体构建失败: {e}"))?;
+        let form = reqwest::multipart::Form::new()
+            .part("file", wav_part)
+            .text("model", model.to_string());
+        match client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", config.api_key))
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(resp) => break resp,
+            Err(e) if e.is_timeout() => return Err("providerRequestTimeout".to_string()),
+            Err(e) if (e.is_connect() || e.is_request()) && attempt < MAX_ATTEMPTS => {
+                let backoff = (200u64 * 2u64.pow((attempt - 1).min(3))).min(900);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                continue;
             }
-        })?;
+            Err(_) => return Err("providerNetworkError".to_string()),
+        }
+    };
     let status = response.status();
     if !status.is_success() {
         return Err(format!("providerHttpStatus:{}", status.as_u16()));
@@ -1032,11 +1150,6 @@ async fn validate_asr_transcription(config: &ProviderConfig, model: &str) -> Res
 
 fn asr_transcriptions_url(base_url: &str) -> Result<String, String> {
     let parsed = reqwest::Url::parse(base_url.trim()).map_err(|_| "endpointInvalid".to_string())?;
-    let host = parsed.host_str().unwrap_or_default();
-    let localhost = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1";
-    if parsed.scheme() != "https" && !localhost {
-        return Err("endpointMustUseHttps".to_string());
-    }
 
     // Work on the URL path only so we don't corrupt query parameters.
     let mut url = parsed.clone();
@@ -2320,6 +2433,9 @@ pub fn foundry_local_asr_set_model(
 ) -> Result<(), String> {
     validate_foundry_model_alias(&model_alias)?;
     let mut prefs = coord.prefs().get();
+    if prefs.foundry_local_asr_model == model_alias {
+        return Ok(());
+    }
     prefs.foundry_local_asr_model = model_alias;
     coord.prefs().set(prefs).map_err(|e| e.to_string())
 }
@@ -2331,6 +2447,9 @@ pub fn foundry_local_asr_set_language_hint(
 ) -> Result<(), String> {
     let normalized = normalize_foundry_language_hint(&language_hint)?;
     let mut prefs = coord.prefs().get();
+    if prefs.foundry_local_asr_language_hint == normalized {
+        return Ok(());
+    }
     prefs.foundry_local_asr_language_hint = normalized;
     coord.prefs().set(prefs).map_err(|e| e.to_string())
 }
@@ -2341,7 +2460,11 @@ pub fn foundry_local_asr_set_runtime_source(
     source: String,
 ) -> Result<(), String> {
     let mut prefs = coord.prefs().get();
-    prefs.foundry_local_runtime_source = normalize_foundry_runtime_source(&source);
+    let normalized = normalize_foundry_runtime_source(&source);
+    if prefs.foundry_local_runtime_source == normalized {
+        return Ok(());
+    }
+    prefs.foundry_local_runtime_source = normalized;
     coord.prefs().set(prefs).map_err(|e| e.to_string())
 }
 
@@ -2396,6 +2519,237 @@ pub async fn foundry_local_asr_release(
 fn emit_foundry_prepare_progress(app: &AppHandle, payload: FoundryPrepareProgressPayload) {
     if let Err(error) = app.emit("foundry-local-asr-prepare-progress", payload) {
         log::warn!("[foundry-asr] emit prepare progress failed: {error}");
+    }
+}
+
+// ───────────── Windows local ASR (sherpa-onnx-local, offline batch + online) ─────────────
+//
+// 命令形态与 Foundry 同形，让前端命令封装可以复用同一种 hook 模式；当前支持
+// catalog / 下载 / prepare / release / 删除 / 状态查询，推理由 coordinator 的
+// 听写链路触发。offline 模型停止录音后 batch decode；online 模型录音时输出 partial。
+
+fn active_sherpa_model_from_prefs(prefs: &UserPreferences) -> String {
+    if sherpa_model_alias_is_known(&prefs.sherpa_onnx_model) {
+        prefs.sherpa_onnx_model.clone()
+    } else {
+        SHERPA_DEFAULT_MODEL_ALIAS.to_string()
+    }
+}
+
+fn validate_sherpa_model_alias(model_alias: &str) -> Result<(), String> {
+    if sherpa_model_alias_is_known(model_alias) {
+        Ok(())
+    } else {
+        Err(format!("unknown sherpa-onnx model alias: {model_alias}"))
+    }
+}
+
+fn normalize_sherpa_language_hint(language_hint: &str) -> Result<String, String> {
+    let normalized = language_hint.trim().to_lowercase();
+    if normalized.is_empty()
+        || normalized
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '-')
+    {
+        Ok(normalized)
+    } else {
+        Err("language hint must be empty or BCP-47 lowercase code".to_string())
+    }
+}
+
+#[tauri::command]
+pub async fn sherpa_onnx_asr_status(
+    coord: CoordinatorState<'_>,
+    runtime: State<'_, Arc<SherpaOnnxRuntime>>,
+) -> Result<SherpaRuntimeStatus, String> {
+    let prefs = coord.prefs().get();
+    let active_model = active_sherpa_model_from_prefs(&prefs);
+    Ok(runtime.status_snapshot(&active_model).await)
+}
+
+#[tauri::command]
+pub async fn sherpa_onnx_asr_catalog(
+    runtime: State<'_, Arc<SherpaOnnxRuntime>>,
+) -> Result<Vec<SherpaCatalogModel>, String> {
+    runtime
+        .catalog_snapshot()
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn sherpa_onnx_asr_fetch_remote_info(
+    model_alias: String,
+    mirror: Option<String>,
+) -> Result<SherpaRemoteInfo, String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    let mirror = mirror.as_deref().map(Mirror::from_str).unwrap_or_default();
+    fetch_sherpa_remote_info(&model_alias, mirror)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn sherpa_onnx_asr_download_model(
+    app: AppHandle,
+    manager: State<'_, Arc<SherpaDownloadManager>>,
+    model_alias: String,
+    mirror: Option<String>,
+) -> Result<(), String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    let mirror = mirror.as_deref().map(Mirror::from_str).unwrap_or_default();
+    manager.start(app, model_alias, mirror);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn sherpa_onnx_asr_cancel_download(
+    manager: State<'_, Arc<SherpaDownloadManager>>,
+    model_alias: String,
+) -> Result<(), String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    manager.cancel(&model_alias);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn sherpa_onnx_asr_set_model(
+    coord: CoordinatorState<'_>,
+    model_alias: String,
+) -> Result<(), String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    let mut prefs = coord.prefs().get();
+    if prefs.sherpa_onnx_model == model_alias {
+        return Ok(());
+    }
+    prefs.sherpa_onnx_model = model_alias;
+    coord.prefs().set(prefs).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn sherpa_onnx_asr_set_language_hint(
+    coord: CoordinatorState<'_>,
+    language_hint: String,
+) -> Result<(), String> {
+    let normalized = normalize_sherpa_language_hint(&language_hint)?;
+    let mut prefs = coord.prefs().get();
+    if prefs.sherpa_onnx_language_hint == normalized {
+        return Ok(());
+    }
+    prefs.sherpa_onnx_language_hint = normalized;
+    coord.prefs().set(prefs).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn sherpa_onnx_asr_prepare(
+    app: AppHandle,
+    runtime: State<'_, Arc<SherpaOnnxRuntime>>,
+    model_alias: String,
+) -> Result<String, String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    let progress_app = app.clone();
+    let result = runtime
+        .ensure_loaded_with_progress(&model_alias, move |payload| {
+            emit_sherpa_prepare_progress(&progress_app, payload);
+        })
+        .await;
+    match result {
+        Ok(loaded) => Ok(loaded),
+        Err(error) => {
+            let message = format!("{error:#}");
+            emit_sherpa_prepare_progress(
+                &app,
+                SherpaPrepareProgressPayload::failed(
+                    model_alias,
+                    "sherpa-onnx prepare failed",
+                    message.clone(),
+                ),
+            );
+            Err(message)
+        }
+    }
+}
+
+#[tauri::command]
+pub fn sherpa_onnx_asr_cancel_prepare(
+    runtime: State<'_, Arc<SherpaOnnxRuntime>>,
+) -> Result<(), String> {
+    runtime.request_cancel_prepare();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn sherpa_onnx_asr_release(
+    runtime: State<'_, Arc<SherpaOnnxRuntime>>,
+) -> Result<(), String> {
+    runtime.release_now().await.map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn sherpa_onnx_asr_model_dir(model_alias: String) -> Result<String, String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    SherpaOnnxRuntime::model_dir_for_alias(&model_alias)
+        .map(|path| path.display().to_string())
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn sherpa_onnx_asr_delete_model(
+    runtime: State<'_, Arc<SherpaOnnxRuntime>>,
+    model_alias: String,
+) -> Result<(), String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    runtime
+        .delete_model(&model_alias)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn sherpa_onnx_asr_reveal_model_dir(model_alias: String) -> Result<(), String> {
+    validate_sherpa_model_alias(&model_alias)?;
+    let dir = SherpaOnnxRuntime::model_dir_for_alias(&model_alias).map_err(|e| format!("{e:#}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {} failed: {e}", dir.display()))?;
+    open_path_in_file_manager(&dir)
+}
+
+#[cfg(target_os = "windows")]
+fn open_path_in_file_manager(path: &std::path::Path) -> Result<(), String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide_null(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let operation = wide_null("open");
+    let target = wide_null(&path.display().to_string());
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        Err(format!("ShellExecuteW failed: {}", result.0 as isize))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_path_in_file_manager(_path: &std::path::Path) -> Result<(), String> {
+    Err("sherpa-onnx model directory is only supported on Windows".to_string())
+}
+
+fn emit_sherpa_prepare_progress(app: &AppHandle, payload: SherpaPrepareProgressPayload) {
+    if let Err(error) = app.emit("sherpa-onnx-asr-prepare-progress", payload) {
+        log::warn!("[sherpa-asr] emit prepare progress failed: {error}");
     }
 }
 
@@ -2509,13 +2863,13 @@ pub async fn marketplace_list(
     if let Some(n) = limit {
         url.query_pairs_mut().append_pair("limit", &n.to_string());
     }
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("marketplace request failed: {e}"))?;
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .get(url.clone())
+            .timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .map_err(|e| format!("marketplace request failed: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -2536,13 +2890,14 @@ pub async fn marketplace_detail(
     }
     let prefs = coord.prefs().get();
     let base = marketplace_url_from_prefs(&prefs);
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{base}/packs/{pack_id}"))
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("marketplace request failed: {e}"))?;
+    let url = format!("{base}/packs/{pack_id}");
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .map_err(|e| format!("marketplace request failed: {e}"))?;
     if !resp.status().is_success() {
         let status = resp.status();
         return Err(format!("marketplace HTTP {status}"));
@@ -2565,38 +2920,40 @@ pub async fn marketplace_install(
     }
     let prefs = coord.prefs().get();
     let base = marketplace_url_from_prefs(&prefs);
-    let client = reqwest::Client::new();
 
     // 先拉 detail 拿 authorLogin —— 装好后本地写 originAuthorLogin，
     // 后续编辑+发布时 backend 据此判 supersede（原作者）vs derivative（他人 fork）。
     let detail_url = format!("{base}/packs/{pack_id}");
-    let detail: serde_json::Value = client
-        .get(&detail_url)
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("marketplace detail failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("marketplace detail HTTP error: {e}"))?
-        .json()
-        .await
-        .map_err(|e| format!("parse detail failed: {e}"))?;
+    let detail: serde_json::Value = net::send_with_retry(|| {
+        net::http()
+            .get(&detail_url)
+            .timeout(std::time::Duration::from_secs(15))
+    })
+    .await
+    .map_err(|e| format!("marketplace detail failed: {e}"))?
+    .error_for_status()
+    .map_err(|e| format!("marketplace detail HTTP error: {e}"))?
+    .json()
+    .await
+    .map_err(|e| format!("parse detail failed: {e}"))?;
     let origin_author_login = detail
         .get("authorLogin")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let bytes = client
-        .get(format!("{base}/packs/{pack_id}/download"))
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|e| format!("marketplace download failed: {e}"))?
-        .error_for_status()
-        .map_err(|e| format!("marketplace HTTP error: {e}"))?
-        .bytes()
-        .await
-        .map_err(|e| format!("read body failed: {e}"))?;
+    let download_url = format!("{base}/packs/{pack_id}/download");
+    let bytes = net::send_with_retry(|| {
+        net::http()
+            .get(&download_url)
+            .timeout(std::time::Duration::from_secs(30))
+    })
+    .await
+    .map_err(|e| format!("marketplace download failed: {e}"))?
+    .error_for_status()
+    .map_err(|e| format!("marketplace HTTP error: {e}"))?
+    .bytes()
+    .await
+    .map_err(|e| format!("read body failed: {e}"))?;
 
     // pack_id 已经过 UUID 白名单，拼临时文件路径安全。
     let tmp = std::env::temp_dir().join(format!("openless-marketplace-{pack_id}.zip"));
@@ -2651,7 +3008,8 @@ pub async fn marketplace_upload(
     let bytes = std::fs::read(&tmp).map_err(|e| format!("read exported zip: {e}"))?;
     let _ = std::fs::remove_file(&tmp);
 
-    let client = reqwest::Client::new();
+    // multipart 上传：表单是流式 body，不走 send_with_retry 的闭包重试；改用共享
+    // 客户端 —— 之前 list/detail 命令若已打开过连接，这里直接复用连接池里的连接。
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(format!("{pack_id}.zip"))
         .mime_str("application/zip")
@@ -2660,7 +3018,7 @@ pub async fn marketplace_upload(
     if let Some(ref oid) = origin_pack_id {
         form = form.text("origin_pack_id", oid.clone());
     }
-    let resp = client
+    let resp = net::http()
         .post(format!("{base}/packs"))
         .header("X-Dev-User", dev_user)
         .timeout(std::time::Duration::from_secs(30))
@@ -2711,14 +3069,15 @@ pub async fn marketplace_like(
     if dev_user.is_empty() {
         return Err("未登录：先在 Settings 填发布者名字".into());
     }
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base}/packs/{pack_id}/like"))
-        .header("X-Dev-User", dev_user)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("like request failed: {e}"))?;
+    let like_url = format!("{base}/packs/{pack_id}/like");
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .post(&like_url)
+            .header("X-Dev-User", dev_user.as_str())
+            .timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .map_err(|e| format!("like request failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("like HTTP {}", resp.status()));
     }
@@ -2743,14 +3102,15 @@ pub async fn marketplace_delete(
     if dev_user.is_empty() {
         return Err("未登录：先在 Settings 填发布者名字".into());
     }
-    let client = reqwest::Client::new();
-    let resp = client
-        .delete(format!("{base}/packs/{pack_id}"))
-        .header("X-Dev-User", dev_user)
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .map_err(|e| format!("delete request failed: {e}"))?;
+    let delete_url = format!("{base}/packs/{pack_id}");
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .delete(&delete_url)
+            .header("X-Dev-User", dev_user.as_str())
+            .timeout(std::time::Duration::from_secs(15))
+    })
+    .await
+    .map_err(|e| format!("delete request failed: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
@@ -2768,14 +3128,15 @@ pub async fn marketplace_my_likes(coord: CoordinatorState<'_>) -> Result<Vec<Str
     if dev_user.is_empty() {
         return Ok(Vec::new()); // 未登录就空集合，UI 渲染无红心
     }
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{base}/me/likes"))
-        .header("X-Dev-User", dev_user)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("my-likes request failed: {e}"))?;
+    let likes_url = format!("{base}/me/likes");
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .get(&likes_url)
+            .header("X-Dev-User", dev_user.as_str())
+            .timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .map_err(|e| format!("my-likes request failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("my-likes HTTP {}", resp.status()));
     }
@@ -2795,14 +3156,15 @@ pub async fn marketplace_my_packs(
     if dev_user.is_empty() {
         return Ok(Vec::new());
     }
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{base}/me/packs"))
-        .header("X-Dev-User", dev_user)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|e| format!("my-packs request failed: {e}"))?;
+    let packs_url = format!("{base}/me/packs");
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .get(&packs_url)
+            .header("X-Dev-User", dev_user.as_str())
+            .timeout(std::time::Duration::from_secs(10))
+    })
+    .await
+    .map_err(|e| format!("my-packs request failed: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("my-packs HTTP {}", resp.status()));
     }
@@ -2861,18 +3223,16 @@ pub struct GithubDeviceStartResponse {
 #[tauri::command]
 pub async fn github_device_flow_start() -> Result<GithubDeviceStartResponse, String> {
     let client_id = get_github_oauth_client_id()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-    let resp = client
-        .post("https://github.com/login/device/code")
-        .header("Accept", "application/json")
-        .header("User-Agent", "OpenLess")
-        .form(&[("client_id", client_id.as_str()), ("scope", "read:user")])
-        .send()
-        .await
-        .map_err(|e| format!("调用 GitHub /login/device/code 失败：{e}"))?;
+    let resp = net::send_with_retry(|| {
+        net::http()
+            .post("https://github.com/login/device/code")
+            .header("Accept", "application/json")
+            .header("User-Agent", "OpenLess")
+            .timeout(std::time::Duration::from_secs(15))
+            .form(&[("client_id", client_id.as_str()), ("scope", "read:user")])
+    })
+    .await
+    .map_err(|e| format!("调用 GitHub /login/device/code 失败：{e}"))?;
     let status = resp.status();
     let body: serde_json::Value = resp
         .json()
@@ -2909,36 +3269,36 @@ pub async fn github_device_flow_poll(
     device_code: String,
 ) -> Result<GithubDevicePollResult, String> {
     let client_id = get_github_oauth_client_id()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("build http client: {e}"))?;
-    let token_resp = client
-        .post("https://github.com/login/oauth/access_token")
-        .header("Accept", "application/json")
-        .header("User-Agent", "OpenLess")
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("device_code", device_code.as_str()),
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("调用 GitHub /login/oauth/access_token 失败：{e}"))?;
+    let token_resp = net::send_with_retry(|| {
+        net::http()
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .header("User-Agent", "OpenLess")
+            .timeout(std::time::Duration::from_secs(15))
+            .form(&[
+                ("client_id", client_id.as_str()),
+                ("device_code", device_code.as_str()),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+            ])
+    })
+    .await
+    .map_err(|e| format!("调用 GitHub /login/oauth/access_token 失败：{e}"))?;
     let body: serde_json::Value = token_resp
         .json()
         .await
         .map_err(|e| format!("解析 access_token 响应失败：{e}"))?;
 
     if let Some(token) = body["access_token"].as_str() {
-        let user_resp = client
-            .get("https://api.github.com/user")
-            .header("User-Agent", "OpenLess")
-            .header("Accept", "application/vnd.github+json")
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|e| format!("调用 GitHub /user 失败：{e}"))?;
+        let user_resp = net::send_with_retry(|| {
+            net::http()
+                .get("https://api.github.com/user")
+                .header("User-Agent", "OpenLess")
+                .header("Accept", "application/vnd.github+json")
+                .timeout(std::time::Duration::from_secs(15))
+                .bearer_auth(token)
+        })
+        .await
+        .map_err(|e| format!("调用 GitHub /user 失败：{e}"))?;
         let user_body: serde_json::Value = user_resp
             .json()
             .await
@@ -2968,12 +3328,13 @@ pub async fn github_device_flow_poll(
 mod tests {
     use super::{
         active_asr_is_keyless_for_validation, active_foundry_model_from_prefs,
-        asr_configured_for_provider, asr_transcriptions_url, fetch_provider_models,
-        is_gemini_base_url, is_valid_local_pack_id, is_valid_session_id,
+        active_sherpa_model_from_prefs, asr_configured_for_provider, asr_transcriptions_url,
+        fetch_provider_models, is_gemini_base_url, is_valid_local_pack_id, is_valid_session_id,
         llm_configured_for_provider, local_asr_release_plan_for_provider, models_url,
-        normalize_foundry_language_hint, parse_gemini_model_ids, parse_latest_beta_from_atom,
-        parse_model_ids, persist_settings, release_foundry_runtime_if_inactive,
-        validate_foundry_model_alias, ProviderConfig, SettingsWriter,
+        normalize_foundry_language_hint, normalize_sherpa_language_hint, parse_gemini_model_ids,
+        parse_latest_beta_from_atom, parse_model_ids, persist_settings,
+        release_foundry_runtime_if_inactive, release_sherpa_runtime_if_inactive,
+        validate_foundry_model_alias, validate_sherpa_model_alias, ProviderConfig, SettingsWriter,
     };
     use crate::persistence::CredentialsSnapshot;
     use crate::types::{
@@ -2987,9 +3348,17 @@ mod tests {
     #[derive(Default)]
     struct FakeSettingsWriter {
         saved: Mutex<Option<UserPreferences>>,
+        active_asr_provider_syncs: Mutex<Vec<String>>,
+        write_settings_error: Mutex<Option<String>>,
+        write_settings_errors: Mutex<Vec<Option<String>>>,
+        active_asr_provider_sync_error: Mutex<Option<String>>,
+        active_asr_provider_sync_errors: Mutex<Vec<Option<String>>>,
         dictation_refreshes: Mutex<u32>,
         qa_refreshes: Mutex<u32>,
         combo_refreshes: Mutex<u32>,
+        translation_refreshes: Mutex<u32>,
+        switch_style_refreshes: Mutex<u32>,
+        open_app_refreshes: Mutex<u32>,
     }
 
     fn snapshot() -> CredentialsSnapshot {
@@ -3039,9 +3408,19 @@ mod tests {
             crate::asr::local::foundry::PROVIDER_ID,
             &snapshot()
         ));
+        #[cfg(target_os = "windows")]
+        assert!(asr_configured_for_provider(
+            crate::asr::local::sherpa::PROVIDER_ID,
+            &snapshot()
+        ));
         #[cfg(not(target_os = "windows"))]
         assert!(!asr_configured_for_provider(
             crate::asr::local::foundry::PROVIDER_ID,
+            &snapshot()
+        ));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!asr_configured_for_provider(
+            crate::asr::local::sherpa::PROVIDER_ID,
             &snapshot()
         ));
     }
@@ -3073,9 +3452,17 @@ mod tests {
         assert!(active_asr_is_keyless_for_validation(
             crate::asr::local::foundry::PROVIDER_ID
         ));
+        #[cfg(target_os = "windows")]
+        assert!(active_asr_is_keyless_for_validation(
+            crate::asr::local::sherpa::PROVIDER_ID
+        ));
         #[cfg(not(target_os = "windows"))]
         assert!(!active_asr_is_keyless_for_validation(
             crate::asr::local::foundry::PROVIDER_ID
+        ));
+        #[cfg(not(target_os = "windows"))]
+        assert!(!active_asr_is_keyless_for_validation(
+            crate::asr::local::sherpa::PROVIDER_ID
         ));
         assert!(!active_asr_is_keyless_for_validation("volcengine"));
         assert!(!active_asr_is_keyless_for_validation("whisper"));
@@ -3086,14 +3473,22 @@ mod tests {
         let qwen = local_asr_release_plan_for_provider(crate::asr::local::PROVIDER_ID);
         assert!(!qwen.qwen);
         assert!(qwen.foundry);
+        assert!(qwen.sherpa);
 
         let foundry = local_asr_release_plan_for_provider(crate::asr::local::foundry::PROVIDER_ID);
         assert!(foundry.qwen);
         assert!(!foundry.foundry);
+        assert!(foundry.sherpa);
+
+        let sherpa = local_asr_release_plan_for_provider(crate::asr::local::sherpa::PROVIDER_ID);
+        assert!(sherpa.qwen);
+        assert!(sherpa.foundry);
+        assert!(!sherpa.sherpa);
 
         let cloud = local_asr_release_plan_for_provider("volcengine");
         assert!(cloud.qwen);
         assert!(cloud.foundry);
+        assert!(cloud.sherpa);
     }
 
     #[cfg(target_os = "windows")]
@@ -3104,6 +3499,17 @@ mod tests {
         release_foundry_runtime_if_inactive(&runtime, true).await;
 
         assert!(runtime.cancel_prepare_requested_for_tests());
+    }
+
+    #[tokio::test]
+    async fn provider_switch_release_requests_sherpa_prepare_cancel_first() {
+        let runtime = std::sync::Arc::new(crate::asr::local::SherpaOnnxRuntime::new());
+
+        release_sherpa_runtime_if_inactive(&runtime, true).await;
+
+        assert!(runtime.cancel_prepare_requested_for_tests());
+        let status = runtime.status_snapshot("sense-voice-small-zh").await;
+        assert!(!status.runtime_ready);
     }
 
     #[test]
@@ -3154,6 +3560,49 @@ mod tests {
 
             assert_eq!(active_foundry_model_from_prefs(&prefs), alias);
         }
+    }
+
+    #[test]
+    fn sherpa_language_hint_accepts_empty_and_supported_lowercase_tags() {
+        assert_eq!(normalize_sherpa_language_hint("").unwrap(), "");
+        assert_eq!(normalize_sherpa_language_hint("   ").unwrap(), "");
+        assert_eq!(normalize_sherpa_language_hint("zh").unwrap(), "zh");
+        assert_eq!(normalize_sherpa_language_hint(" en ").unwrap(), "en");
+        assert_eq!(normalize_sherpa_language_hint("zh-cn").unwrap(), "zh-cn");
+        assert_eq!(normalize_sherpa_language_hint("yue").unwrap(), "yue");
+    }
+
+    #[test]
+    fn sherpa_language_hint_normalizes_uppercase_and_rejects_digits() {
+        assert_eq!(normalize_sherpa_language_hint("ZH").unwrap(), "zh");
+        assert!(normalize_sherpa_language_hint("zh-1").is_err());
+        assert!(normalize_sherpa_language_hint("zh_CN").is_err());
+    }
+
+    #[test]
+    fn sherpa_model_alias_validation_matches_catalog() {
+        assert!(
+            validate_sherpa_model_alias(crate::asr::local::sherpa::DEFAULT_MODEL_ALIAS).is_ok()
+        );
+        assert!(validate_sherpa_model_alias("qwen3-asr-0.6b-int8").is_ok());
+        assert!(
+            validate_sherpa_model_alias(crate::asr::local::sherpa::DEFAULT_ONLINE_MODEL_ALIAS)
+                .is_ok()
+        );
+        assert!(validate_sherpa_model_alias("zipformer-zh-streaming").is_err());
+    }
+
+    #[test]
+    fn sherpa_active_model_pref_falls_back_to_default_for_unknown_alias() {
+        let prefs = UserPreferences {
+            sherpa_onnx_model: "zipformer-zh-streaming".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            active_sherpa_model_from_prefs(&prefs),
+            crate::asr::local::sherpa::DEFAULT_MODEL_ALIAS
+        );
     }
 
     #[test]
@@ -3209,8 +3658,51 @@ mod tests {
     }
 
     impl SettingsWriter for FakeSettingsWriter {
+        fn read_settings(&self) -> UserPreferences {
+            self.saved.lock().unwrap().clone().unwrap_or_default()
+        }
+
         fn write_settings(&self, prefs: UserPreferences) -> Result<(), String> {
+            if let Some(error) = {
+                let mut errors = self.write_settings_errors.lock().unwrap();
+                if errors.is_empty() {
+                    None
+                } else {
+                    errors.remove(0)
+                }
+            } {
+                return Err(error);
+            }
+            if let Some(error) = self.write_settings_error.lock().unwrap().clone() {
+                return Err(error);
+            }
             *self.saved.lock().unwrap() = Some(prefs);
+            Ok(())
+        }
+
+        fn sync_active_asr_provider(&self, provider: &str) -> Result<(), String> {
+            self.active_asr_provider_syncs
+                .lock()
+                .unwrap()
+                .push(provider.to_string());
+            if let Some(error) = {
+                let mut errors = self.active_asr_provider_sync_errors.lock().unwrap();
+                if errors.is_empty() {
+                    None
+                } else {
+                    errors.remove(0)
+                }
+            } {
+                return Err(error);
+            }
+            if let Some(error) = self
+                .active_asr_provider_sync_error
+                .lock()
+                .unwrap()
+                .clone()
+            {
+                return Err(error);
+            }
             Ok(())
         }
 
@@ -3226,9 +3718,17 @@ mod tests {
             *self.combo_refreshes.lock().unwrap() += 1;
         }
 
-        fn refresh_translation_hotkey(&self) {}
-        fn refresh_switch_style_hotkey(&self) {}
-        fn refresh_open_app_hotkey(&self) {}
+        fn refresh_translation_hotkey(&self) {
+            *self.translation_refreshes.lock().unwrap() += 1;
+        }
+
+        fn refresh_switch_style_hotkey(&self) {
+            *self.switch_style_refreshes.lock().unwrap() += 1;
+        }
+
+        fn refresh_open_app_hotkey(&self) {
+            *self.open_app_refreshes.lock().unwrap() += 1;
+        }
     }
 
     #[test]
@@ -3264,6 +3764,10 @@ mod tests {
         assert_eq!(
             asr_transcriptions_url("https://api.openai.com/v1?api-version=2024-12-01").unwrap(),
             "https://api.openai.com/v1/audio/transcriptions?api-version=2024-12-01"
+        );
+        assert_eq!(
+            asr_transcriptions_url("http://192.168.1.10:8000/v1").unwrap(),
+            "http://192.168.1.10:8000/v1/audio/transcriptions"
         );
     }
 
@@ -3337,18 +3841,36 @@ mod tests {
     }
 
     #[test]
-    fn persist_settings_refreshes_both_hotkey_pipelines() {
+    fn persist_settings_refreshes_changed_hotkey_pipelines() {
         let writer = FakeSettingsWriter::default();
+        let previous = UserPreferences::default();
+        *writer.saved.lock().unwrap() = Some(previous);
         let prefs = UserPreferences {
-            hotkey: HotkeyBinding {
-                trigger: HotkeyTrigger::RightControl,
-                mode: HotkeyMode::Toggle,
-                ..Default::default()
+            dictation_hotkey: ShortcutBinding {
+                primary: "D".to_string(),
+                modifiers: vec!["ctrl".to_string()],
             },
             qa_hotkey: Some(ShortcutBinding {
-                primary: ";".to_string(),
-                modifiers: vec!["ctrl".to_string(), "shift".to_string()],
+                primary: "Q".to_string(),
+                modifiers: vec!["ctrl".to_string(), "alt".to_string()],
             }),
+            translation_hotkey: ShortcutBinding {
+                primary: "T".to_string(),
+                modifiers: vec!["ctrl".to_string(), "alt".to_string()],
+            },
+            switch_style_hotkey: ShortcutBinding {
+                primary: "S".to_string(),
+                modifiers: vec!["ctrl".to_string(), "alt".to_string()],
+            },
+            open_app_hotkey: ShortcutBinding {
+                primary: "O".to_string(),
+                modifiers: vec!["ctrl".to_string(), "alt".to_string()],
+            },
+            hotkey: HotkeyBinding {
+                trigger: HotkeyTrigger::Custom,
+                mode: HotkeyMode::Hold,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -3360,15 +3882,186 @@ mod tests {
             .unwrap()
             .clone()
             .expect("settings saved");
-        assert_eq!(saved.hotkey.trigger, HotkeyTrigger::RightOption);
+        assert_eq!(saved.hotkey.trigger, HotkeyTrigger::Custom);
         assert_eq!(saved.hotkey.mode, prefs.hotkey.mode);
         assert_eq!(
-            saved.qa_hotkey.unwrap().primary,
-            prefs.qa_hotkey.unwrap().primary
+            saved.dictation_hotkey.primary,
+            prefs.dictation_hotkey.primary
         );
+        assert_eq!(saved.qa_hotkey.unwrap().primary, "Q");
         assert_eq!(*writer.dictation_refreshes.lock().unwrap(), 1);
-        assert_eq!(*writer.qa_refreshes.lock().unwrap(), 1);
         assert_eq!(*writer.combo_refreshes.lock().unwrap(), 1);
+        assert_eq!(*writer.qa_refreshes.lock().unwrap(), 1);
+        assert_eq!(*writer.translation_refreshes.lock().unwrap(), 1);
+        assert_eq!(*writer.switch_style_refreshes.lock().unwrap(), 1);
+        assert_eq!(*writer.open_app_refreshes.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn persist_settings_syncs_active_asr_provider_without_hotkey_refresh() {
+        let writer = FakeSettingsWriter::default();
+        let previous = UserPreferences::default();
+        *writer.saved.lock().unwrap() = Some(previous.clone());
+        let prefs = UserPreferences {
+            active_asr_provider: "whisper".to_string(),
+            microphone_device_name: "External Mic".to_string(),
+            hotkey: previous.hotkey,
+            dictation_hotkey: previous.dictation_hotkey,
+            qa_hotkey: previous.qa_hotkey,
+            translation_hotkey: previous.translation_hotkey,
+            switch_style_hotkey: previous.switch_style_hotkey,
+            open_app_hotkey: previous.open_app_hotkey,
+            ..Default::default()
+        };
+
+        persist_settings(&writer, prefs.clone()).unwrap();
+
+        let saved = writer
+            .saved
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("settings saved");
+        assert_eq!(saved.active_asr_provider, prefs.active_asr_provider);
+        assert_eq!(saved.microphone_device_name, prefs.microphone_device_name);
+        assert_eq!(
+            writer.active_asr_provider_syncs.lock().unwrap().clone(),
+            vec![prefs.active_asr_provider.clone()]
+        );
+        assert_eq!(*writer.dictation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.combo_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.qa_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.translation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.switch_style_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.open_app_refreshes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn persist_settings_does_not_save_when_active_asr_sync_fails() {
+        let writer = FakeSettingsWriter::default();
+        let previous = UserPreferences::default();
+        *writer.saved.lock().unwrap() = Some(previous.clone());
+        *writer.active_asr_provider_sync_error.lock().unwrap() = Some("sync failed".to_string());
+        let prefs = UserPreferences {
+            active_asr_provider: "whisper".to_string(),
+            microphone_device_name: "External Mic".to_string(),
+            hotkey: previous.hotkey,
+            dictation_hotkey: previous.dictation_hotkey,
+            qa_hotkey: previous.qa_hotkey,
+            translation_hotkey: previous.translation_hotkey,
+            switch_style_hotkey: previous.switch_style_hotkey,
+            open_app_hotkey: previous.open_app_hotkey,
+            ..Default::default()
+        };
+
+        let error = persist_settings(&writer, prefs).unwrap_err();
+
+        assert_eq!(error, "sync failed");
+        let saved = writer
+            .saved
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("previous settings remain saved");
+        assert_eq!(saved.active_asr_provider, previous.active_asr_provider);
+        assert_eq!(saved.microphone_device_name, previous.microphone_device_name);
+        assert_eq!(
+            writer.active_asr_provider_syncs.lock().unwrap().clone(),
+            vec!["whisper".to_string()]
+        );
+        assert_eq!(*writer.dictation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.combo_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.qa_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.translation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.switch_style_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.open_app_refreshes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn persist_settings_restores_active_asr_provider_when_save_fails_after_sync() {
+        let writer = FakeSettingsWriter::default();
+        let previous = UserPreferences::default();
+        *writer.saved.lock().unwrap() = Some(previous.clone());
+        *writer.write_settings_error.lock().unwrap() = Some("save failed".to_string());
+        let prefs = UserPreferences {
+            active_asr_provider: "whisper".to_string(),
+            microphone_device_name: "External Mic".to_string(),
+            hotkey: previous.hotkey,
+            dictation_hotkey: previous.dictation_hotkey,
+            qa_hotkey: previous.qa_hotkey,
+            translation_hotkey: previous.translation_hotkey,
+            switch_style_hotkey: previous.switch_style_hotkey,
+            open_app_hotkey: previous.open_app_hotkey,
+            ..Default::default()
+        };
+
+        let error = persist_settings(&writer, prefs).unwrap_err();
+
+        assert_eq!(error, "save failed");
+        let saved = writer
+            .saved
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("previous settings remain saved");
+        assert_eq!(saved.active_asr_provider, previous.active_asr_provider);
+        assert_eq!(saved.microphone_device_name, previous.microphone_device_name);
+        assert_eq!(
+            writer.active_asr_provider_syncs.lock().unwrap().clone(),
+            vec![
+                "whisper".to_string(),
+                previous.active_asr_provider.clone()
+            ]
+        );
+        assert_eq!(*writer.dictation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.combo_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.qa_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.translation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.switch_style_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.open_app_refreshes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn persist_settings_keeps_new_active_asr_provider_when_rollback_fails() {
+        let writer = FakeSettingsWriter::default();
+        let previous = UserPreferences::default();
+        *writer.saved.lock().unwrap() = Some(previous.clone());
+        *writer.write_settings_errors.lock().unwrap() =
+            vec![Some("save failed".to_string()), None];
+        *writer.active_asr_provider_sync_errors.lock().unwrap() =
+            vec![None, Some("rollback failed".to_string())];
+        let prefs = UserPreferences {
+            active_asr_provider: "whisper".to_string(),
+            microphone_device_name: "External Mic".to_string(),
+            hotkey: previous.hotkey,
+            dictation_hotkey: previous.dictation_hotkey,
+            qa_hotkey: previous.qa_hotkey,
+            translation_hotkey: previous.translation_hotkey,
+            switch_style_hotkey: previous.switch_style_hotkey,
+            open_app_hotkey: previous.open_app_hotkey,
+            ..Default::default()
+        };
+
+        persist_settings(&writer, prefs.clone()).expect("settings remain consistent");
+
+        let saved = writer
+            .saved
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("new settings saved");
+        assert_eq!(saved.active_asr_provider, prefs.active_asr_provider);
+        assert_eq!(saved.microphone_device_name, prefs.microphone_device_name);
+        assert_eq!(
+            writer.active_asr_provider_syncs.lock().unwrap().clone(),
+            vec!["whisper".to_string(), previous.active_asr_provider.clone()]
+        );
+        assert_eq!(*writer.dictation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.combo_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.qa_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.translation_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.switch_style_refreshes.lock().unwrap(), 0);
+        assert_eq!(*writer.open_app_refreshes.lock().unwrap(), 0);
     }
 
     #[test]

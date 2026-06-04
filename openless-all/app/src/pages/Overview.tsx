@@ -1,6 +1,6 @@
 // Overview.tsx — 真实指标，从 listHistory + getCredentials 派生。
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Icon } from '../components/Icon';
 import { formatComboLabel } from '../lib/hotkey';
@@ -31,6 +31,7 @@ const ASR_NAME_KEY_BY_ID: Record<string, string> = {
   groq: 'asrGroq',
   whisper: 'asrWhisper',
   'foundry-local-whisper': 'asrFoundryLocalWhisper',
+  'sherpa-onnx-local': 'asrSherpaOnnxLocal',
   'local-qwen3': 'asrLocalQwen3',
 };
 
@@ -63,6 +64,7 @@ export function Overview({ onOpenHistory }: OverviewProps) {
     arkConfigured: false,
   });
   const { prefs } = useHotkeySettings();
+  const credentialsRequestSeq = useRef(0);
 
   const refreshHistory = useCallback(() => {
     setHistoryError(false);
@@ -74,17 +76,25 @@ export function Overview({ onOpenHistory }: OverviewProps) {
       });
   }, []);
 
-  useEffect(() => {
-    refreshHistory();
+  const refreshCredentials = useCallback(() => {
+    const requestSeq = credentialsRequestSeq.current + 1;
+    credentialsRequestSeq.current = requestSeq;
+    setCredsError(false);
     getCredentials()
       .then(status => {
+        if (requestSeq !== credentialsRequestSeq.current) return;
         setCreds(status);
         setCredsError(false);
       })
       .catch(error => {
+        if (requestSeq !== credentialsRequestSeq.current) return;
         console.error('[overview] failed to load credentials status', error);
         setCredsError(true);
-    });
+      });
+  }, []);
+
+  useEffect(() => {
+    refreshHistory();
   }, [refreshHistory]);
 
   useEffect(() => {
@@ -113,41 +123,9 @@ export function Overview({ onOpenHistory }: OverviewProps) {
     };
   }, [refreshHistory]);
 
-  // 凭据被保存后重新拉取状态（issue #532：在 Settings 中填写/更新凭据
-  // 但不切换提供商时，原有的 useEffect 不会重跑，导致概览页的状态仍停留在「未配置」）。
   useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        const { listen } = await import('@tauri-apps/api/event');
-        const handle = await listen('credentials:changed', () => {
-          getCredentials()
-            .then(status => {
-              if (cancelled) return;
-              setCreds(status);
-              setCredsError(false);
-            })
-            .catch(error => {
-              if (cancelled) return;
-              console.error('[overview] failed to load credentials status', error);
-              setCredsError(true);
-            });
-        });
-        if (cancelled) {
-          handle();
-        } else {
-          unlisten = handle;
-        }
-      } catch {
-        // browser dev mock — 没有 Tauri event bridge
-      }
-    })();
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, []);
+    refreshCredentials();
+  }, [refreshCredentials, prefs?.activeAsrProvider, prefs?.activeLlmProvider]);
 
   const metrics = useMemo(() => {
     const today = new Date();

@@ -1,13 +1,14 @@
 {
   "name": "openless-app",
   "private": true,
-  "version": "1.3.4",
+  "version": "1.3.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "check:macos-capsule-spaces": "node scripts/macos-capsule-spaces-contract.test.mjs",
     "check:hotkey-injection": "node scripts/check-hotkey-injection.mjs"
   },
   "dependencies": {

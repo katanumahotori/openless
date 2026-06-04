@@ -24,6 +24,7 @@ mod insertion;
 #[cfg(target_os = "linux")]
 mod linux_fcitx;
 mod llm_gemini;
+mod net;
 mod permissions;
 mod persistence;
 mod polish;
@@ -68,12 +69,20 @@ use crate::types::PolishMode;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let foundry_local_runtime = Arc::new(asr::local::FoundryLocalRuntime::new());
+    let sherpa_onnx_runtime = Arc::new(asr::local::SherpaOnnxRuntime::new());
+    let sherpa_download_manager =
+        Arc::new(asr::local::sherpa_download::SherpaDownloadManager::new());
     #[cfg(target_os = "windows")]
-    let coordinator = Arc::new(coordinator::Coordinator::new_with_foundry_runtime(
+    let coordinator = Arc::new(coordinator::Coordinator::new_with_local_runtimes(
         Arc::clone(&foundry_local_runtime),
+        Arc::clone(&sherpa_onnx_runtime),
     ));
     #[cfg(not(target_os = "windows"))]
     let coordinator = Arc::new(coordinator::Coordinator::new());
+    #[cfg(target_os = "windows")]
+    if let Err(error) = coordinator.sync_active_asr_provider_from_preferences() {
+        log::warn!("[startup] sync active ASR provider from preferences failed: {error}");
+    }
     let local_asr_download_manager = Arc::new(asr::local::DownloadManager::new());
 
     tauri::Builder::default()
@@ -123,7 +132,9 @@ pub fn run() {
         ))
         .manage(coordinator.clone())
         .manage(local_asr_download_manager.clone())
+        .manage(sherpa_download_manager.clone())
         .manage(foundry_local_runtime.clone())
+        .manage(sherpa_onnx_runtime.clone())
         .manage(commands::MicrophoneMonitorState::new(None))
         .manage(commands::TrayMicrophoneMenuState::new(Vec::new()))
         .setup(move |app| {
@@ -200,8 +211,47 @@ pub fn run() {
                 let suppress_show = !force_show && coordinator.prefs().get().start_minimized;
                 if suppress_show {
                     log::info!("[main] start_minimized=true → 跳过初始 show，等用户点托盘");
-                } else if let Err(e) = main.show() {
-                    log::warn!("[main] initial show failed: {e}");
+                } else {
+                    #[cfg(target_os = "linux")]
+                    {
+                        // Workaround for Linux Wayland WebKitGTK compositing:
+                        // `visible:false` → `show()` can leave the webview surface
+                        // without a valid input region. The ±1px nudge forces
+                        // GTK size-allocate → input surface reattach.
+                        // Ref: tauri#9394, cc-switch linux_fix.rs
+                        let main_clone = main.clone();
+                        let _ = main_clone.set_focus();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            let _ = main_clone.set_focus();
+                            if let Ok(orig) = main_clone.inner_size() {
+                                let bumped = tauri::PhysicalSize::new(
+                                    orig.width.saturating_add(1),
+                                    orig.height,
+                                );
+                                let _ = main_clone.set_size(bumped);
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                let _ = main_clone.set_size(orig);
+                                log::info!("[main] Linux nudge: focus + surface reactivation done");
+                                // Reconcile: compositor may have coalesced the two
+                                // set_size calls, leaving the window at width+1.
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                if let Ok(after) = main_clone.inner_size() {
+                                    // Only correct the ±1px nudge artifact — if the
+                                    // compositor or user resized the window significantly
+                                    // during this window, don't clobber that change.
+                                    let dw = if after.width > orig.width { after.width - orig.width } else { orig.width - after.width };
+                                    let dh = if after.height > orig.height { after.height - orig.height } else { orig.height - after.height };
+                                    if dw <= 1 && dh <= 1 && (dw > 0 || dh > 0) {
+                                        let _ = main_clone.set_size(orig);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    if let Err(e) = main.show() {
+                        log::warn!("[main] initial show failed: {e}");
+                    }
                 }
             }
 
@@ -212,6 +262,11 @@ pub fn run() {
                 let status = permissions::request_accessibility();
                 log::info!("[startup] Accessibility status = {:?}", status);
             }
+
+            // AppImage / 便携版：fcitx5 插件缺了就从 bundled resources 自动安装
+            // 到 ~/.local/ 下面。不会覆盖系统已有的插件。
+            #[cfg(target_os = "linux")]
+            crate::linux_fcitx::ensure_plugin_installed(app.handle());
 
             // 菜单栏图标 — 与 Swift `MenuBarController` 同语义：
             // 左键点 → 显示/聚焦主窗口；菜单含「显示主窗口」「退出」。
@@ -382,6 +437,32 @@ pub fn run() {
             commands::foundry_local_asr_prepare,
             commands::foundry_local_asr_cancel_prepare,
             commands::foundry_local_asr_release,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_status,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_catalog,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_fetch_remote_info,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_download_model,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_cancel_download,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_set_model,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_set_language_hint,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_prepare,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_cancel_prepare,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_release,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_model_dir,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_delete_model,
+            #[cfg(target_os = "windows")]
+            commands::sherpa_onnx_asr_reveal_model_dir,
             commands::export_error_log,
             restart_app,
         ])

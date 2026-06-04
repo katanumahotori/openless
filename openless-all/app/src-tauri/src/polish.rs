@@ -39,7 +39,7 @@ pub struct OpenAICompatibleConfig {
     pub request_timeout_secs: u64,
     /// true = 让支持的 OpenAI-compatible provider 启用推理 / 思考；
     /// false = 按渠道级官方参数关闭或压低思考。不做模型白名单判断，
-    /// 具体模型兼容性交给 provider 处理。
+    /// 但 OpenAI 官方渠道会跳过已知不支持 reasoning_effort 的普通 chat 模型。
     pub thinking_enabled: bool,
 }
 
@@ -1519,13 +1519,20 @@ fn unix_now_secs() -> u64 {
 fn apply_openai_compatible_thinking_control(body: &mut Value, config: &OpenAICompatibleConfig) {
     match openai_compatible_thinking_control(&config.provider_id) {
         Some(ThinkingControl::ReasoningEffort) => {
-            // OpenAI Chat Completions 的 reasoning_effort 是渠道级请求字段。
-            // 关闭时统一压到 low，避免引入模型白名单；不支持该字段的模型由 provider 自行处理。
-            body["reasoning_effort"] = json!(if config.thinking_enabled {
-                "medium"
+            // OpenAI 官方 Chat Completions 只在推理模型族接受 reasoning_effort；
+            // 普通 chat 模型会直接 400。其它兼容渠道按渠道声明继续下发。
+            let effort = if config.provider_id.trim() == "openai" {
+                openai_chat_reasoning_effort(&config.model, config.thinking_enabled)
             } else {
-                "low"
-            });
+                Some(if config.thinking_enabled {
+                    "medium"
+                } else {
+                    "low"
+                })
+            };
+            if let Some(effort) = effort {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
         Some(ThinkingControl::EnableThinking) => {
             body["enable_thinking"] = json!(config.thinking_enabled);
@@ -1594,6 +1601,28 @@ fn openai_compatible_thinking_control(provider_id: &str) -> Option<ThinkingContr
         "alibabaCoding" => Some(ThinkingControl::EnableThinking),
         "openai" | "codingPlanX" => Some(ThinkingControl::ReasoningEffort),
         _ => None,
+    }
+}
+
+fn openai_chat_reasoning_effort(model: &str, thinking_enabled: bool) -> Option<&'static str> {
+    let normalized = model
+        .trim()
+        .strip_prefix("openai/")
+        .unwrap_or_else(|| model.trim())
+        .to_ascii_lowercase();
+
+    if normalized.starts_with("gpt-5-pro") {
+        return Some("high");
+    }
+
+    if normalized.starts_with("o1")
+        || normalized.starts_with("o3")
+        || normalized.starts_with("o4")
+        || normalized.starts_with("gpt-5")
+    {
+        Some(if thinking_enabled { "medium" } else { "low" })
+    } else {
+        None
     }
 }
 
@@ -3106,14 +3135,14 @@ mod tests {
     }
 
     #[test]
-    fn openai_chat_body_adds_reasoning_effort_for_openai_channel() {
+    fn openai_chat_body_adds_reasoning_effort_for_openai_reasoning_model() {
         let provider = OpenAICompatibleLLMProvider::new(
             OpenAICompatibleConfig::new(
                 "openai",
                 "OpenAI",
                 "https://api.openai.com/v1",
                 "k",
-                "any-model",
+                "gpt-5-mini",
             )
             .with_thinking_enabled(true),
         );
@@ -3121,6 +3150,49 @@ mod tests {
         let body = provider.chat_body(false, vec![json!({ "role": "user", "content": "hi" })]);
 
         assert_eq!(body["reasoning_effort"], "medium");
+    }
+
+    #[test]
+    fn openai_chat_body_omits_reasoning_effort_for_non_reasoning_chat_models() {
+        for model in ["gpt-4o-mini", "gpt-4o", "gpt-4.1-nano"] {
+            let provider = OpenAICompatibleLLMProvider::new(
+                OpenAICompatibleConfig::new(
+                    "openai",
+                    "OpenAI",
+                    "https://api.openai.com/v1",
+                    "k",
+                    model,
+                )
+                .with_thinking_enabled(true),
+            );
+
+            let body = provider.chat_body(false, vec![json!({ "role": "user", "content": "hi" })]);
+
+            assert!(
+                body.get("reasoning_effort").is_none(),
+                "{model} must not receive reasoning_effort"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_chat_body_uses_high_reasoning_effort_for_gpt_5_pro() {
+        for thinking_enabled in [false, true] {
+            let provider = OpenAICompatibleLLMProvider::new(
+                OpenAICompatibleConfig::new(
+                    "openai",
+                    "OpenAI",
+                    "https://api.openai.com/v1",
+                    "k",
+                    "gpt-5-pro",
+                )
+                .with_thinking_enabled(thinking_enabled),
+            );
+
+            let body = provider.chat_body(false, vec![json!({ "role": "user", "content": "hi" })]);
+
+            assert_eq!(body["reasoning_effort"], "high");
+        }
     }
 
     #[test]
@@ -3232,7 +3304,8 @@ mod tests {
         assert!(prompt.contains("# 三、双层格式"));
         assert!(prompt.contains("第一层（主题）"));
         assert!(prompt.contains("第二层（子项）"));
-        assert!(prompt.contains("事项 ≤ 2 条"));
+        assert!(prompt.contains("事项仅 1 条"));
+        assert!(prompt.contains("事项 = 2 条"));
         assert!(prompt.contains("事项 ≥ 3 条"));
 
         // 防回归：模型名、字段名、布尔值和版本号必须被显式保护。
@@ -3258,14 +3331,14 @@ mod tests {
     fn structured_prompt_keeps_regrouping_and_no_loss_guards() {
         let prompt = prompts::system_prompt(PolishMode::Structured);
 
-        // v1.3.0 回归的关键规则：已编号 ≠ 不用改、≥3 必须重组、≤2 不硬塞层级。
+        // v1.3.0 回归的关键规则：已编号 ≠ 不用改、≥3 必须重组、仅 1 条事项输出连贯段落。
         assert!(
             prompt.contains("照抄原结构 = 失败"),
             "Structured prompt 必须把照抄原结构判为失败"
         );
         assert!(
-            prompt.contains("不硬塞层级"),
-            "Structured prompt 必须避免短输入过度结构化"
+            prompt.contains("输出连贯段落"),
+            "Structured prompt 必须避免短输入过度结构化（仅 1 条事项 → 连贯段落）"
         );
         assert!(
             prompt.contains("不丢失任何一件事"),

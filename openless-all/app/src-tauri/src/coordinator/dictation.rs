@@ -667,6 +667,67 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
         return Ok(());
     }
 
+    // Windows sherpa-onnx-local：与 Foundry 同形分支，复用 Recorder /
+    // ActiveAsr / start_recorder_and_enter_listening。offline 模型走 batch；
+    // online 模型在 provider 内部 worker 中边录边解码，并通过 local-asr-token
+    // 推 partial 给前端胶囊。
+    #[cfg(target_os = "windows")]
+    if sherpa::is_sherpa_onnx_local(&active_asr) {
+        let prefs = inner.prefs.get();
+        let model_alias = if sherpa::model_alias_is_known(&prefs.sherpa_onnx_model) {
+            prefs.sherpa_onnx_model.clone()
+        } else {
+            sherpa::DEFAULT_MODEL_ALIAS.to_string()
+        };
+        let language_hint = prefs.sherpa_onnx_language_hint.trim().to_string();
+        let language_hint = if language_hint.is_empty() {
+            None
+        } else {
+            Some(language_hint)
+        };
+        let token_handler = inner.app.lock().clone().map(|app| {
+            Arc::new(move |piece: String| {
+                if let Err(error) = app.emit("local-asr-token", piece) {
+                    log::warn!("[sherpa-asr] emit token failed: {error}");
+                }
+            }) as crate::asr::local::sherpa_provider::SherpaTokenHandler
+        });
+        let local = match SherpaOnnxAsr::new_for_model(
+            Arc::clone(&inner.sherpa_onnx_runtime),
+            model_alias,
+            language_hint,
+            token_handler,
+        )
+        .await
+        {
+            Ok(local) => Arc::new(local),
+            Err(e) => {
+                log::error!("[coord] sherpa-onnx init failed: {e:#}");
+                emit_capsule(
+                    inner,
+                    CapsuleState::Error,
+                    0.0,
+                    0,
+                    Some(format!("本地模型初始化失败: {e}")),
+                    None,
+                );
+                restore_prepared_windows_ime_session(inner, current_session_id);
+                inner.state.lock().phase = SessionPhase::Idle;
+                schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                return Err(format!("sherpa-onnx init failed: {e}"));
+            }
+        };
+        store_asr_for_session(
+            inner,
+            current_session_id,
+            ActiveAsr::SherpaOnnxLocal(Arc::clone(&local)),
+        );
+        let consumer: Arc<dyn crate::recorder::AudioConsumer> = local;
+        start_recorder_and_enter_listening(inner, current_session_id, &active_asr, consumer)
+            .await?;
+        return Ok(());
+    }
+
     #[cfg(target_os = "macos")]
     if crate::asr::local::is_local_qwen3(&active_asr) {
         let local = match build_local_qwen3(inner).await {
@@ -1295,6 +1356,46 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                 }
             }
         }
+        // Windows sherpa-onnx offline batch：停止录音后整段转写，再复用现有
+        // polish / insert / history 收尾路径。
+        #[cfg(target_os = "windows")]
+        ActiveAsr::SherpaOnnxLocal(local) => {
+            debug_assert!(!uses_global_timeout);
+            match local
+                .transcribe(sherpa_audio_transcribe_timeout_duration())
+                .await
+            {
+                Ok(r) => {
+                    schedule_sherpa_onnx_release(inner, current_session_id);
+                    r
+                }
+                Err(e) => {
+                    if inner.state.lock().cancelled {
+                        log::info!(
+                            "[coord] sherpa-onnx transcribe cancelled — discarding transcript"
+                        );
+                        schedule_sherpa_onnx_release(inner, current_session_id);
+                        restore_prepared_windows_ime_session(inner, current_session_id);
+                        set_phase_idle_if_session_matches(inner, current_session_id);
+                        return Ok(());
+                    }
+                    log::error!("[coord] sherpa-onnx transcribe failed: {e:#}");
+                    schedule_sherpa_onnx_release(inner, current_session_id);
+                    emit_capsule(
+                        inner,
+                        CapsuleState::Error,
+                        0.0,
+                        elapsed,
+                        Some(format!("本地识别失败: {e}")),
+                        None,
+                    );
+                    restore_prepared_windows_ime_session(inner, current_session_id);
+                    inner.state.lock().phase = SessionPhase::Idle;
+                    schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    return Err(e.to_string());
+                }
+            }
+        }
         #[cfg(target_os = "macos")]
         ActiveAsr::Local(local) => {
             debug_assert!(uses_global_timeout);
@@ -1526,6 +1627,9 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     log::info!(
         "[coord] polish dispatch: translation={translation_active} mode={mode:?} streaming_eligible={streaming_eligible}"
     );
+
+    // Linux: emit_capsule(Polishing) 已通过 fcitx5 auxDown 显示 "✨ 润色中..."，
+    // 无需在此重复调用。
 
     let (polished, polish_error, already_streamed) = if translation_active {
         log::info!(
