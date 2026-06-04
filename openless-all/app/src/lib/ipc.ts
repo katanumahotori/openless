@@ -82,7 +82,7 @@ let mockSettings: UserPreferences = {
     muteDuringRecording: false,
     audioCueOnRecord: true,
     microphoneDeviceName: "",
-    activeAsrProvider: "foundry-local-whisper",
+    activeAsrProvider: "volcengine",
     activeLlmProvider: "ark",
     llmThinkingEnabled: false,
     restoreClipboardAfterPaste: true,
@@ -424,7 +424,7 @@ const mockHotkeyCapability: HotkeyCapability = {
 }
 
 const mockCredentialsStatus: CredentialsStatus = {
-    activeAsrProvider: "foundry-local-whisper",
+    activeAsrProvider: "volcengine",
     activeLlmProvider: "ark",
     asrConfigured: true,
     llmConfigured: true,

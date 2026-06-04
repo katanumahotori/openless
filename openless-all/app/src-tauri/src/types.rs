@@ -784,14 +784,11 @@ fn default_sherpa_onnx_model() -> String {
 }
 
 fn default_active_asr_provider() -> String {
-    #[cfg(target_os = "windows")]
-    {
-        return crate::asr::local::foundry::PROVIDER_ID.into();
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        "volcengine".into()
-    }
+    // Keep the default on a cloud provider. Local ASR engines are useful, but
+    // Windows runtime/model setup can block dictation when a preferences file is
+    // missing the active provider field or gets partially rewritten during an
+    // upgrade. Users can still opt into local ASR from Settings.
+    "volcengine".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2324,6 +2321,16 @@ mod tests {
         let prefs: UserPreferences = serde_json::from_str("{}").unwrap();
 
         assert!(prefs.audio_cue_on_record);
+    }
+
+    #[test]
+    fn missing_active_asr_provider_pref_defaults_to_cloud_provider() {
+        // Local ASR requires runtime/model setup. A missing or partially
+        // migrated preferences file must not silently switch Windows users to
+        // Foundry and leave dictation waiting in the transcribe/polish phase.
+        let prefs: UserPreferences = serde_json::from_str("{}").unwrap();
+
+        assert_eq!(prefs.active_asr_provider, "volcengine");
     }
 
     #[test]

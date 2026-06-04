@@ -2019,8 +2019,8 @@ mod tests {
     }
 
     #[test]
-    fn streaming_insert_eligible_when_gates_allow() {
-        assert!(streaming_insert_eligible(
+    fn streaming_insert_stays_disabled_until_windows_port_is_reenabled() {
+        assert!(!streaming_insert_eligible(
             true,
             false,
             PolishMode::Light,
