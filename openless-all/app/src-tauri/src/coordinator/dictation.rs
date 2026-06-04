@@ -1404,12 +1404,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
         };
         let prefs_snapshot = inner.prefs.get();
-        if let Err(e) = inner.history.append_with_retention(
+        match inner.history.append_with_retention(
             session,
             prefs_snapshot.history_retention_days,
             prefs_snapshot.history_max_entries,
         ) {
-            log::error!("[coord] history append failed: {e}");
+            Ok(()) => super::emit_history_changed(inner),
+            Err(e) => log::error!("[coord] history append failed: {e}"),
         }
         emit_capsule(
             inner,
@@ -1722,12 +1723,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         // 开关打开但路径创建失败时这里是 false，避免前端渲染播放按钮后端 404。
         has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
     };
-    if let Err(e) = inner.history.append_with_retention(
+    match inner.history.append_with_retention(
         session,
         prefs_snapshot.history_retention_days,
         prefs_snapshot.history_max_entries,
     ) {
-        log::error!("[coord] history append failed: {e}");
+        Ok(()) => super::emit_history_changed(inner),
+        Err(e) => log::error!("[coord] history append failed: {e}"),
     }
     let done_message = if tsf_required_insert_failed {
         Some("TSF 未上屏，已禁止非 TSF 兜底".to_string())

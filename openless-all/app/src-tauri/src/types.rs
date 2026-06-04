@@ -1,6 +1,6 @@
 //! Shared value types crossing the IPC boundary.
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -91,6 +91,7 @@ pub struct DictationSession {
     pub created_at: String, // ISO-8601
     pub raw_transcript: String,
     pub final_text: String,
+    #[serde(default, deserialize_with = "deserialize_dictation_session_mode")]
     pub mode: PolishMode,
     pub app_bundle_id: Option<String>,
     pub app_name: Option<String>,
@@ -103,6 +104,45 @@ pub struct DictationSession {
     /// `None` / `Some(false)` 都按"无录音"处理；旧 JSON 不带这字段也兼容。
     #[serde(default)]
     pub has_audio_recording: Option<bool>,
+}
+
+fn deserialize_dictation_session_mode<'de, D>(deserializer: D) -> Result<PolishMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "raw" | "builtin.raw" => Ok(PolishMode::Raw),
+        "light" | "builtin.light" => Ok(PolishMode::Light),
+        "structured" | "builtin.structured" => Ok(PolishMode::Structured),
+        "formal" | "builtin.formal" => Ok(PolishMode::Formal),
+        // Older history entries stored the active custom style-pack id here
+        // (for example `custom:depure`) instead of the pack's base mode. Keep
+        // those records loadable; new writes already store the base mode.
+        legacy
+            if legacy.starts_with("custom:")
+                || legacy.starts_with("custom.")
+                || legacy.starts_with("imported.") =>
+        {
+            Ok(PolishMode::Light)
+        }
+        other => Err(de::Error::unknown_variant(
+            other,
+            &[
+                "raw",
+                "light",
+                "structured",
+                "formal",
+                "builtin.raw",
+                "builtin.light",
+                "builtin.structured",
+                "builtin.formal",
+                "custom:*",
+                "custom.*",
+                "imported.*",
+            ],
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1526,14 +1566,16 @@ pub fn default_style_system_prompt_for_mode(mode: PolishMode) -> String {
     // 到这里只剩 Raw 一种模式（Light / Structured / Formal 都在上面 early-return 了）。
     // 仍用 match 把 _ 兜底为 unreachable!()，让编译期挡住未来加新 mode 时忘了在上面分流。
     let task_and_example = match mode {
-        PolishMode::Raw => "# 任务（原文）\n\
+        PolishMode::Raw => {
+            "# 任务（原文）\n\
             仅做最小化整理：补全标点、必要分句。\n\
             保留原话顺序、用词、语气；\u{4E0D}改写、\u{4E0D}扩写、\u{4E0D}重排。\n\
             可去除明显口癖（\u{55EF}、\u{554A}、那个、就是、you know），但\u{4E0D}改变信息密度。\n\
             \n\
             # 示例\n\
             原：\u{55EF}那个我刚刚跟客户聊完然后他说下周三可以给反馈\n\
-            出：我刚刚跟客户聊完，他说下周三可以给反馈。",
+            出：我刚刚跟客户聊完，他说下周三可以给反馈。"
+        }
 
         PolishMode::Light | PolishMode::Structured | PolishMode::Formal => {
             unreachable!("light/structured/formal handled by early return above")
@@ -2288,6 +2330,51 @@ mod tests {
 
         assert_eq!(prefs.default_mode, PolishMode::Formal);
         assert_eq!(prefs.active_style_pack_id, "custom.meeting");
+    }
+
+    #[test]
+    fn dictation_session_accepts_legacy_custom_mode_history() {
+        let session: DictationSession = serde_json::from_str(
+            r#"{
+                "id": "9ebfbc12-ebe7-4cdc-a7ae-636b268b1f0f",
+                "createdAt": "2026-05-20T05:05:29.202335800+00:00",
+                "rawTranscript": "raw",
+                "finalText": "final",
+                "mode": "custom:depure",
+                "appBundleId": null,
+                "appName": null,
+                "insertStatus": "inserted",
+                "errorCode": null,
+                "durationMs": 12322,
+                "dictionaryEntryCount": 0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(session.mode, PolishMode::Light);
+        assert_eq!(session.final_text, "final");
+    }
+
+    #[test]
+    fn dictation_session_preserves_builtin_mode_history() {
+        let session: DictationSession = serde_json::from_str(
+            r#"{
+                "id": "9ebfbc12-ebe7-4cdc-a7ae-636b268b1f0f",
+                "createdAt": "2026-05-20T05:05:29.202335800+00:00",
+                "rawTranscript": "raw",
+                "finalText": "final",
+                "mode": "structured",
+                "appBundleId": null,
+                "appName": null,
+                "insertStatus": "inserted",
+                "errorCode": null,
+                "durationMs": 12322,
+                "dictionaryEntryCount": 0
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(session.mode, PolishMode::Structured);
     }
 
     #[test]

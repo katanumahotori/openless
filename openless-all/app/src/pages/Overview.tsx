@@ -84,7 +84,33 @@ export function Overview({ onOpenHistory }: OverviewProps) {
       .catch(error => {
         console.error('[overview] failed to load credentials status', error);
         setCredsError(true);
-      });
+    });
+  }, [refreshHistory]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const handle = await listen('history:changed', () => {
+          if (!cancelled) {
+            refreshHistory();
+          }
+        });
+        if (cancelled) {
+          handle();
+        } else {
+          unlisten = handle;
+        }
+      } catch {
+        // browser dev mock — 没有 Tauri event bridge
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, [refreshHistory]);
 
   // 凭据被保存后重新拉取状态（issue #532：在 Settings 中填写/更新凭据

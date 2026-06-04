@@ -97,6 +97,14 @@ static CAPSULE_NO_ACTIVATE_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
 static CAPSULE_SUPPRESSED_BY_TOGGLE_LOGGED: AtomicBool = AtomicBool::new(false);
 static CAPSULE_FIRST_SHOW_LOGGED: AtomicBool = AtomicBool::new(false);
 
+fn emit_history_changed(inner: &Arc<Inner>) {
+    if let Some(app) = inner.app.lock().clone() {
+        if let Err(e) = app.emit("history:changed", ()) {
+            log::warn!("[coord] emit history:changed failed: {e}");
+        }
+    }
+}
+
 /// 给 #470 诊断日志用的 capsule 状态短名。显式枚举每个变体到 &'static str，
 /// 不走 `Debug` —— 哪天 CapsuleState 加了 `String` 字段，`:?` 会把 ASR / polish
 /// 内容意外灌进日志（pr_agent 提的 forward-looking 隐患）；这里只输出状态名。
@@ -3440,12 +3448,13 @@ async fn end_qa_session(inner: &Arc<Inner>) -> Result<(), String> {
             has_audio_recording: None,
         };
         let prefs_snapshot = inner.prefs.get();
-        if let Err(e) = inner.history.append_with_retention(
+        match inner.history.append_with_retention(
             session,
             prefs_snapshot.history_retention_days,
             prefs_snapshot.history_max_entries,
         ) {
-            log::error!("[coord] QA history append failed: {e}");
+            Ok(()) => emit_history_changed(&inner),
+            Err(e) => log::error!("[coord] QA history append failed: {e}"),
         }
     }
 

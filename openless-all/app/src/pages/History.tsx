@@ -80,6 +80,30 @@ export function History() {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const handle = await listen('history:changed', () => {
+          void refresh();
+        });
+        if (cancelled) {
+          handle();
+        } else {
+          unlisten = handle;
+        }
+      } catch {
+        // browser dev mock — 没有 Tauri event bridge
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refresh]);
+
   const filtered = useMemo(
     () => (filter === 'all' ? items : items.filter(s => s.mode === filter)),
     [items, filter],

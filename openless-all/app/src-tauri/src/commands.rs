@@ -1220,19 +1220,33 @@ fn parse_account(s: &str) -> Result<CredentialAccount, String> {
 
 // ─────────────────────────── history ───────────────────────────
 
+fn emit_history_changed(app: &AppHandle) {
+    if let Err(e) = app.emit("history:changed", ()) {
+        log::warn!("[commands] emit history:changed failed: {e}");
+    }
+}
+
 #[tauri::command]
 pub fn list_history(coord: CoordinatorState<'_>) -> Result<Vec<DictationSession>, String> {
     coord.history().list().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn delete_history_entry(coord: CoordinatorState<'_>, id: String) -> Result<(), String> {
-    coord.history().delete(&id).map_err(|e| e.to_string())
+pub fn delete_history_entry(
+    coord: CoordinatorState<'_>,
+    app: AppHandle,
+    id: String,
+) -> Result<(), String> {
+    coord.history().delete(&id).map_err(|e| e.to_string())?;
+    emit_history_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
-pub fn clear_history(coord: CoordinatorState<'_>) -> Result<(), String> {
-    coord.history().clear().map_err(|e| e.to_string())
+pub fn clear_history(coord: CoordinatorState<'_>, app: AppHandle) -> Result<(), String> {
+    coord.history().clear().map_err(|e| e.to_string())?;
+    emit_history_changed(&app);
+    Ok(())
 }
 
 /// 读取某次会话的原始麦克风 wav 字节流。仅当用户开过
