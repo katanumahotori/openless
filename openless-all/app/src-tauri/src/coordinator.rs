@@ -2639,58 +2639,96 @@ where
 
 /// 整形/翻訳 LLM のモデル自動フォールバック。
 ///
-/// 無料枠のモデルは「1日あたりトークン上限（TPD）」に達すると HTTP 429 を返す。
-/// 429 が出たモデルはその UTC 日のあいだ「枯渇」扱いにし、次のモデルへ自動で
-/// 切り替える。UTC 日付が変わる（＝クォータがリセットされる）と枯渇マークも
-/// 自動で消えるため、翌日はメインモデルが再び最優先で使われる。
+/// 無料枠のモデルは HTTP 429 を返すが、日次上限（TPD/RPD）と短時間制限
+/// （TPM/RPM）を同じ扱いにしない。日次上限だけ UTC 日のあいだ「枯渇」扱いにし、
+/// 短時間制限は数分だけ避ける。
 mod model_fallback {
     use parking_lot::Mutex;
+
+    const RATE_LIMIT_COOLDOWN_SECS: i64 = 300;
+
+    struct TemporaryBackoff {
+        model: String,
+        until: i64,
+    }
 
     struct State {
         /// 枯渇マークが有効な UTC 日（エポックからの経過日数）。
         day: i64,
-        /// この日に 429 を返したモデル ID。
-        exhausted: Vec<String>,
+        /// この日に日次上限を返したモデル ID。
+        daily_exhausted: Vec<String>,
+        /// 短時間制限で一時的に避けるモデル ID と解除時刻。
+        temporary_backoffs: Vec<TemporaryBackoff>,
     }
 
     static STATE: Mutex<State> = Mutex::new(State {
         day: 0,
-        exhausted: Vec::new(),
+        daily_exhausted: Vec::new(),
+        temporary_backoffs: Vec::new(),
     });
 
     fn current_utc_day() -> i64 {
         chrono::Utc::now().timestamp().div_euclid(86_400)
     }
 
+    fn current_unix_secs() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
     fn roll_day(state: &mut State) {
         let today = current_utc_day();
         if state.day != today {
             state.day = today;
-            state.exhausted.clear();
+            state.daily_exhausted.clear();
         }
+        let now = current_unix_secs();
+        state.temporary_backoffs.retain(|b| b.until > now);
     }
 
-    /// `model` が今日すでに 429（クォータ枯渇）になっているか。
+    /// `model` が今日の上限、または短時間制限で避ける対象になっているか。
     pub fn is_exhausted(model: &str) -> bool {
         let mut state = STATE.lock();
         roll_day(&mut state);
-        state.exhausted.iter().any(|m| m == model)
+        state.daily_exhausted.iter().any(|m| m == model)
+            || state.temporary_backoffs.iter().any(|b| b.model == model)
     }
 
-    /// `model` を今日の枯渇モデルとして記録する。
-    pub fn mark_exhausted(model: &str) {
+    /// `model` を今日の日次上限モデルとして記録する。
+    pub fn mark_daily_exhausted(model: &str) {
         let mut state = STATE.lock();
         roll_day(&mut state);
-        if !state.exhausted.iter().any(|m| m == model) {
-            state.exhausted.push(model.to_string());
+        if !state.daily_exhausted.iter().any(|m| m == model) {
+            state.daily_exhausted.push(model.to_string());
+        }
+    }
+
+    /// `model` を短時間制限として数分だけ避ける。
+    pub fn mark_rate_limited(model: &str) {
+        let mut state = STATE.lock();
+        roll_day(&mut state);
+        let until = current_unix_secs() + RATE_LIMIT_COOLDOWN_SECS;
+        if let Some(backoff) = state
+            .temporary_backoffs
+            .iter_mut()
+            .find(|b| b.model == model)
+        {
+            backoff.until = until;
+        } else {
+            state.temporary_backoffs.push(TemporaryBackoff {
+                model: model.to_string(),
+                until,
+            });
         }
     }
 }
 
 /// LLM 呼び出し失敗の分類。フォールバック判断に使う。
+#[derive(Debug, PartialEq, Eq)]
 enum LlmFailure {
-    /// 429: 1日のトークン上限超過。次モデルへ切替＋枯渇マーク。
-    Quota,
+    /// 429: 1日のトークン/リクエスト上限超過。次モデルへ切替＋日次枯渇マーク。
+    DailyQuota,
+    /// 429: 分単位などの短時間制限。次モデルへ切替＋短時間だけ避ける。
+    RateLimited,
     /// 5xx（過負荷）/ 400・404（モデル廃止・不明モデル）/ 空応答。次モデルを
     /// 試すが枯渇マークはしない。
     Transient,
@@ -2700,7 +2738,9 @@ enum LlmFailure {
 
 fn classify_llm_error(e: &LLMError) -> LlmFailure {
     match e {
-        LLMError::InvalidResponse { status, .. } if *status == 429 => LlmFailure::Quota,
+        LLMError::InvalidResponse { status, body } if *status == 429 => {
+            classify_rate_limit_body(body)
+        }
         LLMError::InvalidResponse { status, .. }
             if *status >= 500 || *status == 400 || *status == 404 =>
         {
@@ -2709,6 +2749,19 @@ fn classify_llm_error(e: &LLMError) -> LlmFailure {
         // 整形結果が空。次モデルなら正しく返せる可能性があるので次へ。
         LLMError::EmptyResponse => LlmFailure::Transient,
         _ => LlmFailure::Fatal,
+    }
+}
+
+fn classify_rate_limit_body(body: &str) -> LlmFailure {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("tokens per day")
+        || lower.contains("requests per day")
+        || lower.contains("(tpd)")
+        || lower.contains("(rpd)")
+    {
+        LlmFailure::DailyQuota
+    } else {
+        LlmFailure::RateLimited
     }
 }
 
@@ -2906,11 +2959,18 @@ async fn polish_text(
                 return Ok(s);
             }
             Err(e) => match classify_llm_error(&e) {
-                LlmFailure::Quota => {
+                LlmFailure::DailyQuota => {
                     log::warn!(
-                        "[coord] polish: モデル '{candidate}' がクォータ超過 (429)、次のモデルへ切替"
+                        "[coord] polish: モデル '{candidate}' が日次クォータ超過 (429)、今日の残りは次のモデルへ切替"
                     );
-                    model_fallback::mark_exhausted(candidate);
+                    model_fallback::mark_daily_exhausted(candidate);
+                    last_err = Some(e);
+                }
+                LlmFailure::RateLimited => {
+                    log::warn!(
+                        "[coord] polish: モデル '{candidate}' が短時間レート制限 (429)、一時的に次のモデルへ切替"
+                    );
+                    model_fallback::mark_rate_limited(candidate);
                     last_err = Some(e);
                 }
                 LlmFailure::Transient => {
@@ -3035,11 +3095,18 @@ async fn translate_text(
                 return Ok(s);
             }
             Err(e) => match classify_llm_error(&e) {
-                LlmFailure::Quota => {
+                LlmFailure::DailyQuota => {
                     log::warn!(
-                        "[coord] translate: モデル '{candidate}' がクォータ超過 (429)、次のモデルへ切替"
+                        "[coord] translate: モデル '{candidate}' が日次クォータ超過 (429)、今日の残りは次のモデルへ切替"
                     );
-                    model_fallback::mark_exhausted(candidate);
+                    model_fallback::mark_daily_exhausted(candidate);
+                    last_err = Some(e);
+                }
+                LlmFailure::RateLimited => {
+                    log::warn!(
+                        "[coord] translate: モデル '{candidate}' が短時間レート制限 (429)、一時的に次のモデルへ切替"
+                    );
+                    model_fallback::mark_rate_limited(candidate);
                     last_err = Some(e);
                 }
                 LlmFailure::Transient => {
@@ -3776,6 +3843,38 @@ mod tests {
                 "qwen/qwen3-32b",
             ]
         );
+    }
+
+    #[test]
+    fn groq_tpd_429_is_daily_quota() {
+        let err = LLMError::InvalidResponse {
+            status: 429,
+            body: "Rate limit reached for model `openai/gpt-oss-20b` on tokens per day (TPD)"
+                .to_string(),
+        };
+
+        assert_eq!(classify_llm_error(&err), LlmFailure::DailyQuota);
+    }
+
+    #[test]
+    fn groq_tpm_429_is_short_rate_limit() {
+        let err = LLMError::InvalidResponse {
+            status: 429,
+            body: "Rate limit reached for model `openai/gpt-oss-120b` on tokens per minute (TPM)"
+                .to_string(),
+        };
+
+        assert_eq!(classify_llm_error(&err), LlmFailure::RateLimited);
+    }
+
+    #[test]
+    fn unknown_429_is_short_rate_limit_not_daily_quota() {
+        let err = LLMError::InvalidResponse {
+            status: 429,
+            body: "Rate limit reached, please try again later".to_string(),
+        };
+
+        assert_eq!(classify_llm_error(&err), LlmFailure::RateLimited);
     }
 
     #[tokio::test]
