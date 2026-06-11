@@ -14,6 +14,125 @@ use super::*;
 const HOTKEY_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
 const STREAMING_INSERT_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(12);
 
+fn history_keeps_audio_recording(
+    record_audio_for_debug: bool,
+    keep_for_recovery: bool,
+    archive_active: bool,
+) -> bool {
+    archive_active && (record_audio_for_debug || keep_for_recovery)
+}
+
+fn should_delete_audio_archive_on_exit(
+    record_audio_for_debug: bool,
+    keep_for_recovery: bool,
+    archive_active: bool,
+) -> bool {
+    archive_active && !record_audio_for_debug && !keep_for_recovery
+}
+
+struct SessionAudioArchiveRetention {
+    inner: Arc<Inner>,
+    session_id: SessionId,
+    keep_for_recovery: bool,
+}
+
+impl SessionAudioArchiveRetention {
+    fn new(inner: &Arc<Inner>, session_id: SessionId) -> Self {
+        Self {
+            inner: Arc::clone(inner),
+            session_id,
+            keep_for_recovery: false,
+        }
+    }
+
+    fn keep_for_recovery(&mut self) {
+        self.keep_for_recovery = true;
+    }
+
+    fn archive_active(&self) -> bool {
+        self.inner.audio_archive_active.load(Ordering::Relaxed)
+    }
+
+    fn has_audio_recording_for_history(&self) -> bool {
+        history_keeps_audio_recording(
+            self.inner.prefs.get().record_audio_for_debug,
+            self.keep_for_recovery,
+            self.archive_active(),
+        )
+    }
+}
+
+impl Drop for SessionAudioArchiveRetention {
+    fn drop(&mut self) {
+        let prefs = self.inner.prefs.get();
+        if !should_delete_audio_archive_on_exit(
+            prefs.record_audio_for_debug,
+            self.keep_for_recovery,
+            self.archive_active(),
+        ) {
+            return;
+        }
+        match crate::persistence::recording_path_for_session(&self.session_id.to_string()) {
+            Ok(path) => {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        log::warn!(
+                            "[recordings] remove successful-session audio failed for {:?}: {err}",
+                            path
+                        );
+                    }
+                } else {
+                    log::info!(
+                        "[recordings] removed successful-session audio for {}",
+                        self.session_id
+                    );
+                }
+            }
+            Err(err) => log::warn!(
+                "[recordings] resolve audio path failed for {}: {err}",
+                self.session_id
+            ),
+        }
+    }
+}
+
+fn append_failed_dictation_history(
+    inner: &Arc<Inner>,
+    session_id: SessionId,
+    error_code: &'static str,
+    duration_ms: u64,
+    archive_retention: &mut SessionAudioArchiveRetention,
+) {
+    archive_retention.keep_for_recovery();
+    let prefs_snapshot = inner.prefs.get();
+    let session = DictationSession {
+        id: session_id.to_string(),
+        created_at: Utc::now().to_rfc3339(),
+        raw_transcript: String::new(),
+        final_text: String::new(),
+        mode: prefs_snapshot.default_mode,
+        app_bundle_id: None,
+        app_name: None,
+        insert_status: InsertStatus::Failed,
+        error_code: Some(error_code.to_string()),
+        duration_ms: Some(duration_ms),
+        dictionary_entry_count: Some(enabled_phrases(inner).len() as u32),
+        has_audio_recording: Some(archive_retention.has_audio_recording_for_history()),
+    };
+    match inner.history.append_with_retention(
+        session,
+        prefs_snapshot.history_retention_days,
+        prefs_snapshot.history_max_entries,
+    ) {
+        Ok(()) => super::emit_history_changed(inner),
+        Err(e) => log::error!("[coord] recovery history append failed: {e}"),
+    }
+}
+
+fn cleanup_audio_archive_after_non_failure(inner: &Arc<Inner>, session_id: SessionId) {
+    let _cleanup = SessionAudioArchiveRetention::new(inner, session_id);
+}
+
 /// 跑流式润色路径（opt-in，跨平台）。
 ///
 /// 平台差异：
@@ -991,18 +1110,17 @@ pub(super) async fn start_recorder_for_starting(
     let microphone_device_name = selected_microphone_device_name(inner);
     stop_microphone_preview_monitor(inner, "dictation recorder");
     acquire_recording_mute(inner, "dictation").await;
-    let audio_archive_path = if inner.prefs.get().record_audio_for_debug {
-        // 用 coordinator 的 SessionId 作为文件名，跟 history 那条记录 id 对齐（见
-        // 下游 polish 收尾时 `history_session_id = current_session_id.to_string()`）。
-        // 顺手把超龄 / 超量录音清理一下，避免 debug 开关常开时磁盘膨胀。
+    inner.audio_archive_active.store(false, Ordering::Relaxed);
+    let audio_archive_path = {
+        // Always write a temporary WAV while dictating. Successful sessions delete it at
+        // teardown unless the debug preference asks to keep recordings; failed sessions
+        // keep it so the History entry can replay the original audio.
         let prefs = inner.prefs.get();
         let _ = crate::persistence::prune_recordings(
             prefs.history_retention_days,
             prefs.audio_recording_max_entries,
         );
         crate::persistence::recording_path_for_session(&session_id.to_string()).ok()
-    } else {
-        None
     };
     match Recorder::start(
         microphone_device_name,
@@ -1097,6 +1215,14 @@ pub(super) fn abort_recording_with_error(inner: &Arc<Inner>, message: String) {
     };
 
     discard_startup_resources_for_session(inner, abort.session_id);
+    let mut audio_archive_retention = SessionAudioArchiveRetention::new(inner, abort.session_id);
+    append_failed_dictation_history(
+        inner,
+        abort.session_id,
+        "recordingInterrupted",
+        abort.elapsed,
+        &mut audio_archive_retention,
+    );
     restore_prepared_windows_ime_session(inner, abort.session_id);
     {
         let mut state = inner.state.lock();
@@ -1139,11 +1265,13 @@ pub(super) async fn finish_starting_session(inner: &Arc<Inner>, session_id: Sess
                 "[coord] stale recorder/ASR startup continuation from session {session_id} — ignoring"
             );
             discard_startup_resources_for_session(inner, session_id);
+            cleanup_audio_archive_after_non_failure(inner, session_id);
             restore_prepared_windows_ime_session(inner, session_id);
         }
         BeginOutcome::CancelRaced => {
             log::info!("[coord] cancel raced during recorder/ASR startup — aborting begin");
             discard_startup_resources_for_session(inner, session_id);
+            cleanup_audio_archive_after_non_failure(inner, session_id);
             restore_prepared_windows_ime_session(inner, session_id);
             set_phase_idle_if_session_matches(inner, session_id);
         }
@@ -1174,10 +1302,19 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         release_recording_mute(inner, "dictation");
     }
 
+    let mut audio_archive_retention = SessionAudioArchiveRetention::new(inner, current_session_id);
+
     let asr_opt = take_asr_for_session(inner, current_session_id);
     let asr = match asr_opt {
         Some(a) => a,
         None => {
+            append_failed_dictation_history(
+                inner,
+                current_session_id,
+                "asrUnavailable",
+                elapsed,
+                &mut audio_archive_retention,
+            );
             restore_prepared_windows_ime_session(inner, current_session_id);
             inner.state.lock().phase = SessionPhase::Idle;
             return Ok(());
@@ -1208,6 +1345,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrFailed",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err(e.to_string());
                 }
                 Err(_) => {
@@ -1229,6 +1373,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrTimeout",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err("global timeout".to_string());
                 }
             }
@@ -1257,13 +1408,17 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrFailed",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err(e.to_string());
                 }
                 Err(_) => {
-                    log::error!(
-                        "[coord] whisper 全局超时 {} 秒",
-                        timeout_duration.as_secs()
-                    );
+                    log::error!("[coord] whisper 全局超时 {} 秒", timeout_duration.as_secs());
                     emit_capsule(
                         inner,
                         CapsuleState::Error,
@@ -1275,6 +1430,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrTimeout",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err("whisper global timeout".to_string());
                 }
             }
@@ -1300,6 +1462,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrFailed",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err(e.to_string());
                 }
                 Err(_) => {
@@ -1319,6 +1488,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrTimeout",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err("bailian global timeout".to_string());
                 }
             }
@@ -1357,6 +1533,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrFailed",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err(e.to_string());
                 }
             }
@@ -1397,6 +1580,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrFailed",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err(e.to_string());
                 }
             }
@@ -1434,6 +1624,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrFailed",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err(e.to_string());
                 }
                 Err(_) => {
@@ -1453,6 +1650,13 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
                     restore_prepared_windows_ime_session(inner, current_session_id);
                     inner.state.lock().phase = SessionPhase::Idle;
                     schedule_capsule_idle(inner, CAPSULE_AUTO_HIDE_DELAY_MS);
+                    append_failed_dictation_history(
+                        inner,
+                        current_session_id,
+                        "asrTimeout",
+                        elapsed,
+                        &mut audio_archive_retention,
+                    );
                     return Err("local global timeout".to_string());
                 }
             }
@@ -1492,8 +1696,9 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
     }
 
     if raw.text.trim().is_empty() {
+        audio_archive_retention.keep_for_recovery();
         let session = DictationSession {
-            id: Uuid::new_v4().to_string(),
+            id: current_session_id.to_string(),
             created_at: Utc::now().to_rfc3339(),
             raw_transcript: raw.text.clone(),
             final_text: String::new(),
@@ -1507,7 +1712,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
             // empty-transcript（ASR 没识别到任何文字）也保留 wav 标记——这是用户最想
             // 通过原始录音定位"是不是麦克风太小声 / ASR 模型问题"的场景。修 pr_agent
             // "Missing Audio" 反馈。
-            has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
+            has_audio_recording: Some(audio_archive_retention.has_audio_recording_for_history()),
         };
         let prefs_snapshot = inner.prefs.get();
         match inner.history.append_with_retention(
@@ -1807,6 +2012,9 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         allow_non_tsf_insertion_fallback,
     )
     .map(str::to_string);
+    if error_code.is_some() || status == InsertStatus::Failed {
+        audio_archive_retention.keep_for_recovery();
+    }
     let tsf_required_insert_failed = error_code.as_deref() == Some("windowsImeTsfRequired");
 
     // 与 coordinator 内部 SessionId 对齐：方便 recorder 旁路写盘的 `<session_id>.wav`
@@ -1830,7 +2038,7 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         dictionary_entry_count: Some(total_hits.min(u32::MAX as u64) as u32),
         // 用 begin_session 时 Recorder::start 返回的实际写盘状态，而不是 prefs 开关——
         // 开关打开但路径创建失败时这里是 false，避免前端渲染播放按钮后端 404。
-        has_audio_recording: Some(inner.audio_archive_active.load(Ordering::Relaxed)),
+        has_audio_recording: Some(audio_archive_retention.has_audio_recording_for_history()),
     };
     match inner.history.append_with_retention(
         session,
@@ -1909,6 +2117,7 @@ pub(super) fn cancel_session(inner: &Arc<Inner>) {
 
     stop_recorder_for_session(inner, decision.session_id);
     cancel_asr_for_session(inner, decision.session_id);
+    cleanup_audio_archive_after_non_failure(inner, decision.session_id);
     restore_prepared_windows_ime_session(inner, decision.session_id);
     // Processing 阶段保持 phase=Processing 让 end_session 自己走完检查 + 收尾；
     // 其他阶段直接转 Idle。
@@ -1937,7 +2146,8 @@ mod tests {
     use super::{
         append_typed_prefix, batch_asr_chunk_limit_ms, default_done_message,
         drain_streaming_insert_deltas_with, finalize_polished_text,
-        flush_streaming_insert_buffer_with, streaming_insert_eligible,
+        flush_streaming_insert_buffer_with, history_keeps_audio_recording,
+        should_delete_audio_archive_on_exit, streaming_insert_eligible,
     };
     use crate::types::{ChineseScriptPreference, CorrectionRule, InsertStatus, PolishMode};
 
@@ -2021,6 +2231,22 @@ mod tests {
 
         assert_eq!(appended, 1);
         assert_eq!(typed, "好");
+    }
+
+    #[test]
+    fn audio_archive_history_flag_matches_retention_policy() {
+        assert!(!history_keeps_audio_recording(false, false, false));
+        assert!(!history_keeps_audio_recording(false, false, true));
+        assert!(history_keeps_audio_recording(false, true, true));
+        assert!(history_keeps_audio_recording(true, false, true));
+    }
+
+    #[test]
+    fn audio_archive_cleanup_deletes_only_successful_non_debug_recordings() {
+        assert!(!should_delete_audio_archive_on_exit(false, false, false));
+        assert!(should_delete_audio_archive_on_exit(false, false, true));
+        assert!(!should_delete_audio_archive_on_exit(false, true, true));
+        assert!(!should_delete_audio_archive_on_exit(true, false, true));
     }
 
     #[test]

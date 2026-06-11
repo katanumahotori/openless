@@ -99,8 +99,9 @@ pub struct DictationSession {
     pub error_code: Option<String>,
     pub duration_ms: Option<u64>,
     pub dictionary_entry_count: Option<u32>,
-    /// 当 `prefs.record_audio_for_debug` 开启时，本次会话的原始麦克风音频被写到
-    /// `recordings/<id>.wav`。前端凭这个字段决定是否在 History 渲染播放按钮。
+    /// 本次会话的原始麦克风音频是否可从 `recordings/<id>.wav` 读取。成功会话默认会
+    /// 删除临时 WAV，失败会话保留用于恢复；`prefs.record_audio_for_debug` 开启时成功
+    /// 会话也保留。前端凭这个字段决定是否在 History 渲染播放按钮。
     /// `None` / `Some(false)` 都按"无录音"处理；旧 JSON 不带这字段也兼容。
     #[serde(default)]
     pub has_audio_recording: Option<bool>,
