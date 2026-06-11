@@ -2722,6 +2722,8 @@ fn classify_llm_error(e: &LLMError) -> LlmFailure {
 /// - `gpt-oss-20b` … 実績のある `gpt-oss-120b` と同系列。整形ルールの追従が
 ///   近いと期待でき、最優先の予備。
 /// - `llama-3.3-70b-versatile` … 70B 汎用、非推論。指示追従が安定。
+/// - `llama-4-scout` … preview だが高速で、Qwen より前に試す価値がある。
+/// - `compound-mini` … 公式表で価格欄が空の Groq 本番システム。Qwen の前に置く。
 /// - `qwen/qwen3-32b` … 推論モデルだが TPD 最大。最後の砦として残す。
 fn build_model_chain(primary: &str, base_url: &str) -> Vec<String> {
     let mut chain = vec![primary.to_string()];
@@ -2729,6 +2731,8 @@ fn build_model_chain(primary: &str, base_url: &str) -> Vec<String> {
         for m in [
             "openai/gpt-oss-20b",
             "llama-3.3-70b-versatile",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "groq/compound-mini",
             "qwen/qwen3-32b",
         ] {
             if !chain.iter().any(|c| c == m) {
@@ -3757,6 +3761,21 @@ mod tests {
 
     fn session_id(n: u128) -> SessionId {
         Uuid::from_u128(n)
+    }
+
+    #[test]
+    fn groq_model_chain_tries_free_quality_fallbacks_before_qwen() {
+        assert_eq!(
+            build_model_chain("openai/gpt-oss-120b", "https://api.groq.com/openai/v1"),
+            vec![
+                "openai/gpt-oss-120b",
+                "openai/gpt-oss-20b",
+                "llama-3.3-70b-versatile",
+                "meta-llama/llama-4-scout-17b-16e-instruct",
+                "groq/compound-mini",
+                "qwen/qwen3-32b",
+            ]
+        );
     }
 
     #[tokio::test]
