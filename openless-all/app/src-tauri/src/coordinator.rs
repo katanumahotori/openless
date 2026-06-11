@@ -4035,6 +4035,31 @@ mod tests {
     }
 
     #[test]
+    fn cloud_whisper_timeout_has_longer_floor_than_global_guard() {
+        assert_eq!(
+            cloud_whisper_transcribe_timeout(5.0),
+            std::time::Duration::from_secs(CLOUD_WHISPER_MIN_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn cloud_whisper_timeout_scales_for_long_recordings() {
+        // 422s 録音：ceil(422 * 0.5) + 15 = 226s。15s 固定で捨てない。
+        assert_eq!(
+            cloud_whisper_transcribe_timeout(422.0),
+            std::time::Duration::from_secs(226)
+        );
+    }
+
+    #[test]
+    fn cloud_whisper_timeout_is_capped() {
+        assert_eq!(
+            cloud_whisper_transcribe_timeout(1_000.0),
+            std::time::Duration::from_secs(CLOUD_WHISPER_MAX_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
     fn local_qwen_timeout_floors_at_global_timeout_for_short_audio() {
         // 5s 录音：5 × 0.6 = 3, +10 = 13, max(15) = 15。短录音保留 15s 兜底。
         assert_eq!(
@@ -4593,10 +4618,23 @@ const CAPSULE_CANCEL_HIDE_DELAY_MS: u64 = 0;
 /// 设置为 15 秒（比 ASR 的 12 秒 FINAL_RESULT_TIMEOUT 稍长），
 /// 只在 ASR 超时机制失效时作为最后的防线触发。
 const COORDINATOR_GLOBAL_TIMEOUT_SECS: u64 = 15;
+const CLOUD_WHISPER_MIN_TIMEOUT_SECS: u64 = 30;
+const CLOUD_WHISPER_MAX_TIMEOUT_SECS: u64 = 300;
 
 #[cfg(target_os = "windows")]
 fn foundry_audio_transcribe_timeout_duration() -> std::time::Duration {
     std::time::Duration::from_secs(COORDINATOR_GLOBAL_TIMEOUT_SECS)
+}
+
+/// Cloud Whisper/Groq ASR のバッチ転写タイムアウト。
+/// 短い録音は 30s で十分だが、数分の録音は 15s 固定だと転写完了前に捨ててしまう。
+/// 録音時間に比例して待ち、外部 API ハングへの最後の防線として 5 分で打ち切る。
+fn cloud_whisper_transcribe_timeout(audio_secs: f64) -> std::time::Duration {
+    let scaled = ((audio_secs * 0.5).ceil() as u64).saturating_add(15);
+    let secs = scaled
+        .max(CLOUD_WHISPER_MIN_TIMEOUT_SECS)
+        .min(CLOUD_WHISPER_MAX_TIMEOUT_SECS);
+    std::time::Duration::from_secs(secs)
 }
 
 /// 本地 Qwen3-ASR 的动态转写超时。固定 15 秒在长录音（≥ 30s）+ 慢机器
