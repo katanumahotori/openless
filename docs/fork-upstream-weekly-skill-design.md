@@ -285,6 +285,72 @@ Hermes はこの状態で修復しない。レポートだけ出す。
 - `npm run build` 単体はフロントの型チェックと Vite build の確認用。
 - リリースビルド失敗時は、直前の短いテスト結果と切り分けて報告する。
 
+### Fix-Specific Test Matrix
+
+修正作業では、全テストの前に「今直したものだけを刺す専用テスト」を必ず作るか、既存テスト名を明示する。
+
+目的:
+
+- 長いビルドを先に走らせない。
+- 直したつもりの経路を実際に通す。
+- 失敗した時に原因を狭くする。
+- 低めのモデルでも、修正種別から走るテストを選べるようにする。
+
+基本ルール:
+
+1. バグを1文で書く。
+2. 再発条件を1文で書く。
+3. その条件を直接踏む最小テストを選ぶ。
+4. その専用テストが落ちること、または落ちていた理由を確認する。
+5. 修正後に専用テストを通す。
+6. その後で広いテストへ進む。
+7. 最後にだけリリースビルドをする。
+
+修正種別ごとの専用テスト:
+
+| 修正種別 | 最初に走る専用テスト | 次に見る実ログ / 実データ | 最後の確認 |
+|---|---|---|---|
+| 設定継承 | `cargo test streaming_insert --lib` と該当 preference test | `%APPDATA%\OpenLess\preferences.json` | 起動後 readback |
+| TSF / 挿入経路 | `cargo test non_tsf_fallback --lib` | `openless.log` の `clipboard paste fallback` / `Unicode SendInput fallback` | Notepad と Codex/Electron 入力欄 |
+| 履歴保存 | history persistence の該当 unit test | `%APPDATA%\OpenLess\history.json` の最新 `createdAt` / `finalText` | GUI 履歴欄 |
+| 日本語整形 | Japanese quality fixture test | 直近履歴の `rawTranscript` / `finalText` | 質問に回答していないこと |
+| モデル fallback | fallback order / daily exhaustion の unit test | `openless.log` の assembled model | 実モデルが想定段階であること |
+| GUI 読み込み | frontend unit / IPC mock test | devtools/log に読み込みエラーがないこと | GUI の該当欄が表示されること |
+| ビルド・パッケージ | `npm run build` または `cargo build` の片方だけ | build log の末尾 | release build |
+
+今回の再発から追加した固定例:
+
+- 症状: 履歴の `finalText` は正しいが、入力欄では語順が崩れる。
+- 原因候補: streaming insert または TSF 失敗後の Unicode SendInput。
+- 最初の専用テスト:
+
+```powershell
+cd openless-all/app/src-tauri
+cargo test non_tsf_fallback --lib
+```
+
+- 次に見るログ:
+
+```text
+NG: streaming_insert path ENTER
+NG: Unicode SendInput fallback
+OK: TSF unavailable; inserted via clipboard paste fallback
+```
+
+- 実機確認:
+
+```text
+マイクの入力テストをしています。
+```
+
+履歴の `finalText` と入力欄の文字が一致すれば合格。
+
+専用テストが作れない場合:
+
+- 理由を設計メモまたは commit message に残す。
+- 代わりに最小の手動再現手順を書く。
+- 手動確認だけで「できた」と言わない。確認範囲を明示する。
+
 ## Required Regression Guards
 
 ### Settings Inheritance
