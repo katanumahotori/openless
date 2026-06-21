@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "linux", allow(dead_code, unused_variables))]
 //! 系统权限请求 / 检查（macOS / Windows）。
 //!
 //! 与 Swift `Sources/OpenLessHotkey/AccessibilityPermission.swift` +
@@ -243,9 +244,54 @@ mod platform {
     }
 }
 
-// ─────────────────────────── Windows / 其他 ───────────────────────────
+// ─────────────────────────── Android ───────────────────────────
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "android")]
+mod platform {
+    use super::PermissionStatus;
+
+    pub fn check_accessibility() -> PermissionStatus {
+        PermissionStatus::NotApplicable
+    }
+
+    pub fn request_accessibility() -> PermissionStatus {
+        PermissionStatus::NotApplicable
+    }
+
+    pub fn check_microphone() -> PermissionStatus {
+        match crate::android::jni::android::with_android_env(|env, context| {
+            crate::android::jni::android::check_self_permission(
+                env,
+                context,
+                "android.permission.RECORD_AUDIO",
+            )
+        }) {
+            Ok(true) => PermissionStatus::Granted,
+            Ok(false) => PermissionStatus::Denied,
+            Err(error) => {
+                log::warn!("[mic] Android RECORD_AUDIO permission check failed: {error}");
+                PermissionStatus::NotDetermined
+            }
+        }
+    }
+
+    pub fn request_microphone() -> PermissionStatus {
+        match crate::android::jni::android::with_android_env(|env, context| {
+            crate::android::jni::android::request_record_audio_permission(env, context)
+        }) {
+            Ok(true) => PermissionStatus::Granted,
+            Ok(false) => PermissionStatus::NotDetermined,
+            Err(error) => {
+                log::warn!("[mic] Android RECORD_AUDIO permission request failed: {error}");
+                check_microphone()
+            }
+        }
+    }
+}
+
+// ─────────────────────────── Windows / Linux / 其他 ───────────────────────────
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "android")))]
 mod platform {
     use super::PermissionStatus;
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -420,9 +466,4 @@ pub use platform::windows_microphone_access_explicitly_denied;
 #[cfg(not(target_os = "windows"))]
 pub fn windows_microphone_access_explicitly_denied() -> bool {
     false
-}
-
-/// 兼容老调用：startup 时主动弹 Accessibility 框。
-pub fn request_accessibility_with_prompt(_prompt: bool) -> bool {
-    matches!(request_accessibility(), PermissionStatus::Granted)
 }

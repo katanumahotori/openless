@@ -1,15 +1,17 @@
 // History.tsx — 接 Tauri 后端 list_history / delete_history_entry / clear_history。
 // 真实数据来自 ~/Library/Application Support/OpenLess/history.json。
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Icon } from '../components/Icon';
 import { detectOS } from '../components/WindowChrome';
 import { formatComboLabel } from '../lib/hotkey';
-import { clearHistory, deleteHistoryEntry, listHistory, readAudioRecording } from '../lib/ipc';
+import { clearHistory, deleteHistoryEntry, listHistory, readAudioRecording, retranscribeRecording } from '../lib/ipc';
+import { useMobileLayout } from '../lib/useMobileLayout';
 import type { DictationSession, PolishMode } from '../lib/types';
 import { useHotkeySettings } from '../state/HotkeySettingsContext';
 import { Btn, Card, PageHeader, Pill } from './_atoms';
+import { chipSelectedStyle } from './settings/shared';
 
 function useFilters(): Array<{ id: 'all' | PolishMode; label: string }> {
   const { t } = useTranslation();
@@ -38,12 +40,16 @@ export function History() {
   const FILTERS = useFilters();
   const MODE_LABEL = useModeLabel();
   const [filter, setFilter] = useState<'all' | PolishMode>('all');
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
   const [items, setItems] = useState<DictationSession[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [justCopied, setJustCopied] = useState(false);
+  // 「重新转录」进行中：禁用按钮 + 显示「转录中…」，避免重复点击发起多次 ASR。
+  const [retranscribing, setRetranscribing] = useState(false);
   // 录音文件 lazily-detected missing 状态：retention / 条数 cap 清理后磁盘上 wav
   // 可能已被删，但 history 条目 hasAudioRecording 仍写 true。任一组件
   // （播放 / 导出）首次 IPC 拿到 'recording not found' 时把 id 加进来，
@@ -59,6 +65,8 @@ export function History() {
     });
   }, []);
   const { prefs } = useHotkeySettings();
+  const mobile = useMobileLayout();
+  const [mobileDetailOpen, setMobileDetailOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -80,34 +88,39 @@ export function History() {
     void refresh();
   }, [refresh]);
 
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        const { listen } = await import('@tauri-apps/api/event');
-        const handle = await listen('history:changed', () => {
-          void refresh();
-        });
-        if (cancelled) {
-          handle();
-        } else {
-          unlisten = handle;
-        }
-      } catch {
-        // browser dev mock — 没有 Tauri event bridge
-      }
-    })();
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [refresh]);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const searchShortcut = os === 'mac' ? '⌘K' : 'Ctrl+K';
 
-  const filtered = useMemo(
-    () => (filter === 'all' ? items : items.filter(s => s.mode === filter)),
-    [items, filter],
-  );
+  // 搜索词防抖：随输入实时更新 query，300ms 后落到 debouncedQuery 再过滤，
+  // 避免每个按键都重算整张列表（与 Marketplace 同模式）。
+  useEffect(() => {
+    const id = window.setTimeout(() => setDebouncedQuery(query), 300);
+    return () => window.clearTimeout(id);
+  }, [query]);
+
+  // ⌘K / Ctrl+K 聚焦搜索框（设计稿提示的快捷键）。
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  const filtered = useMemo(() => {
+    const byMode = filter === 'all' ? items : items.filter(s => s.mode === filter);
+    const q = debouncedQuery.trim().toLowerCase();
+    if (!q) return byMode;
+    // 按原始转写 + 润色后文本匹配关键词，覆盖用户能想起的两种内容。
+    return byMode.filter(
+      s =>
+        s.rawTranscript.toLowerCase().includes(q) ||
+        s.finalText.toLowerCase().includes(q),
+    );
+  }, [items, filter, debouncedQuery]);
   const item = useMemo(
     () => filtered.find(s => s.id === selectedId) || filtered[0],
     [filtered, selectedId],
@@ -187,6 +200,31 @@ export function History() {
     }
   };
 
+  // 对一条「转录失败 / 没识别到语音」的历史用当前 ASR provider 重新转录（issue #613）。
+  // 后端读 recordings/<id>.wav → 重转 → 原地回写该条 rawTranscript/finalText、清 errorCode，
+  // 返回整条记录；前端据此局部刷新。失败保留 + 自动重试已让这些条目的录音留得住，这里给
+  // 持久失败（重试也没救回来）一个手动重转入口。
+  const onRetranscribe = async () => {
+    if (!item || !item.hasAudioRecording) return;
+    setRetranscribing(true);
+    setActionError(null);
+    try {
+      const updated = await retranscribeRecording(item.id);
+      setItems(prev => prev.map(s => (s.id === updated.id ? updated : s)));
+    } catch (error) {
+      console.error('[history] retranscribe failed', error);
+      const msg = errorMessage(error);
+      // wav 已被 retention / 条数 cap 清理：隐藏入口，不报错（用户没干错事）。
+      if (msg.includes('recording not found') || msg.includes('not found')) {
+        markAudioMissing(item.id);
+        return;
+      }
+      setActionError(t('history.retranscribeFailed', { err: msg }));
+    } finally {
+      setRetranscribing(false);
+    }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
       <PageHeader
@@ -200,7 +238,8 @@ export function History() {
           </div>
         }
       />
-      <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: 14, flex: 1, minHeight: 0 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '300px 1fr', gap: 14, flex: 1, minHeight: 0 }}>
+        {( !mobile || !mobileDetailOpen) && (
         <Card padding={0} style={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
           <div style={{ padding: '12px 14px', borderBottom: '0.5px solid var(--ol-line)' }}>
             <div style={{
@@ -210,7 +249,22 @@ export function History() {
               background: 'var(--ol-surface-2)', color: 'var(--ol-ink-3)',
             }}>
               <Icon name="search" size={12} />
-              <span style={{ flex: 1 }}>{t('history.summary', { total: items.length, shown: filtered.length })}</span>
+              <input
+                ref={searchInputRef}
+                type="search"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                placeholder={t('history.searchPlaceholder', { shortcut: searchShortcut })}
+                aria-label={t('history.searchPlaceholder', { shortcut: searchShortcut })}
+                style={{
+                  flex: 1, minWidth: 0,
+                  outline: 'none', border: 0, background: 'transparent',
+                  fontSize: 12, color: 'var(--ol-ink-1)', fontFamily: 'inherit',
+                }}
+              />
+            </div>
+            <div style={{ marginTop: 6, fontSize: 11, color: 'var(--ol-ink-4)' }}>
+              {t('history.summary', { total: items.length, shown: filtered.length })}
             </div>
             <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 10 }}>
               {FILTERS.map(f => (
@@ -219,9 +273,7 @@ export function History() {
                   onClick={() => setFilter(f.id)}
                   style={{
                     padding: '3px 9px', fontSize: 11, borderRadius: 999,
-                    border: '0.5px solid ' + (filter === f.id ? 'var(--ol-ink)' : 'var(--ol-line-strong)'),
-                    background: filter === f.id ? 'var(--ol-ink)' : 'transparent',
-                    color: filter === f.id ? '#fff' : 'var(--ol-ink-3)',
+                    ...chipSelectedStyle(filter === f.id),
                     cursor: 'default', fontFamily: 'inherit', fontWeight: 500,
                     transition: 'background 0.16s var(--ol-motion-quick), color 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick)',
                   }}
@@ -244,13 +296,18 @@ export function History() {
             )}
             {!loading && !loadError && filtered.length === 0 && (
               <div style={{ padding: 16, fontSize: 12, color: 'var(--ol-ink-4)' }}>
-                {t('history.empty', { trigger: prefs ? formatComboLabel(prefs.dictationHotkey) : '' })}
+                {debouncedQuery.trim()
+                  ? t('history.searchNoMatch', { query: debouncedQuery.trim() })
+                  : t('history.empty', { trigger: prefs ? formatComboLabel(prefs.dictationHotkey) : '' })}
               </div>
             )}
             {!loadError && filtered.map(s => (
               <button
                 key={s.id}
-                onClick={() => setSelectedId(s.id)}
+                onClick={() => {
+                  setSelectedId(s.id);
+                  if (mobile) setMobileDetailOpen(true);
+                }}
                 style={{
                   width: '100%', padding: '10px 12px', textAlign: 'left',
                   display: 'flex', flexDirection: 'column', gap: 4,
@@ -277,11 +334,20 @@ export function History() {
             ))}
           </div>
         </Card>
+        )}
 
+        {(!mobile || mobileDetailOpen) && (
         <Card padding={20} className="ol-thinscroll" style={{ overflow: 'auto' }}>
           {item ? (
             <>
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+              {mobile && (
+                <div style={{ marginBottom: 12 }}>
+                  <Btn icon="chevLeft" variant="ghost" size="sm" onClick={() => setMobileDetailOpen(false)}>
+                    {t('history.backToList')}
+                  </Btn>
+                </div>
+              )}
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14, flexWrap: 'wrap', gap: 8 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <span style={{ fontSize: 13, fontFamily: 'var(--ol-font-mono)', color: 'var(--ol-ink-3)' }}>{formatTime(item.createdAt)}</span>
                   <Pill size="sm" tone="default">{MODE_LABEL[item.mode]}</Pill>
@@ -291,6 +357,13 @@ export function History() {
                   <Btn icon={justCopied ? 'check' : 'copy'} variant="ghost" size="sm" onClick={() => void onCopy()}>{justCopied ? t('common.copied') : t('common.copy')}</Btn>
                   {item.hasAudioRecording && !audioMissingIds.has(item.id) && (
                     <Btn icon="download" variant="ghost" size="sm" onClick={() => void onExportAudio()}>{t('history.exportRecording')}</Btn>
+                  )}
+                  {item.hasAudioRecording
+                    && !audioMissingIds.has(item.id)
+                    && (item.errorCode === 'transcribeFailed' || item.errorCode === 'emptyTranscript') && (
+                    <Btn icon="refresh" variant="ghost" size="sm" disabled={retranscribing} onClick={() => void onRetranscribe()}>
+                      {retranscribing ? t('history.retranscribing') : t('history.retranscribe')}
+                    </Btn>
                   )}
                   <Btn icon="trash" variant="ghost" size="sm" onClick={onDelete}>{t('common.delete')}</Btn>
                 </div>
@@ -302,7 +375,7 @@ export function History() {
                   key={item.id}
                 />
               )}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 12 }}>
                 <div style={{ padding: 14, border: '0.5px solid var(--ol-line)', borderRadius: 10, background: 'var(--ol-surface-2)' }}>
                   <Pill size="sm" tone="outline" style={{ marginBottom: 10 }}>{t('history.rawLabel')}</Pill>
                   <p style={{ margin: 0, fontSize: 13, lineHeight: 1.7, color: 'var(--ol-ink-2)', whiteSpace: 'pre-wrap' }}>
@@ -339,6 +412,7 @@ export function History() {
             </div>
           )}
         </Card>
+        )}
       </div>
     </div>
   );

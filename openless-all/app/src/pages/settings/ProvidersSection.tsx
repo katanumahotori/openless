@@ -14,6 +14,7 @@ import {
   validateProviderCredentials,
 } from '../../lib/ipc';
 import { emitSaved } from '../../lib/savedEvent';
+import { useMobileLayout } from '../../lib/useMobileLayout';
 import { useHotkeySettings } from '../../state/HotkeySettingsContext';
 import { SelectLite } from '../../components/ui/SelectLite';
 import { Card } from '../_atoms';
@@ -21,15 +22,18 @@ import { SettingRow, SectionTitle, Toggle, inputStyle, type AsrPresetId } from '
 
 function LlmThinkingToggle({ enabled, onToggle }: { enabled: boolean; onToggle: (next: boolean) => void }) {
   const { t } = useTranslation();
+  const mobile = useMobileLayout();
   return (
     <div
       title={t('settings.providers.thinkingModeHint')}
       style={{
         display: 'flex',
         alignItems: 'center',
+        flex: mobile ? '1 1 100%' : undefined,
+        flexWrap: mobile ? 'wrap' : 'nowrap',
         gap: 6,
         paddingLeft: 2,
-        whiteSpace: 'nowrap',
+        whiteSpace: mobile ? 'normal' : 'nowrap',
       }}
     >
       <span style={{ fontSize: 11.5, color: 'var(--ol-ink-4)' }}>
@@ -117,6 +121,18 @@ const LLM_PRESETS = [
     modelPlaceholder: 'gpt-5-mini',
   },
   {
+    // MiniMax 国内开放平台（minimaxi.com），OpenAI 兼容 /v1/chat/completions。
+    // M3 默认开启 thinking，可通过 `thinking.type = disabled` 关闭。
+    // provider_id 在后端 polish.rs::openai_compatible_thinking_control 命中
+    // "minimax" → MiniMaxThinking 分支，关闭时下发 disabled、开启时发 adaptive。
+    // 走"自定义"preset 接入时由 base_url 含 "minimax" 兜底识别,见 polish.rs。
+    // 文档: https://platform.minimaxi.com/docs/api-reference/text-chat-openai#thinking-控制
+    id: 'minimax',
+    nameKey: 'minimax',
+    baseUrl: 'https://api.minimaxi.com/v1',
+    modelPlaceholder: 'MiniMax-M3',
+  },
+  {
     id: 'custom',
     nameKey: 'custom',
     baseUrl: '',
@@ -132,7 +148,8 @@ const ASR_DEFAULT_RESOURCE_ID = 'volc.seedasr.sauc.duration';
 // `/audio/transcriptions`（`coordinator.rs::is_whisper_compatible_provider`）。
 // 新增兼容厂商：
 //   1. 在这里加一项 `{ id, nameKey, baseUrl, model }`；
-//   2. `coordinator.rs::is_whisper_compatible_provider` 加同名 id；
+//   2. 若走 Whisper 协议，`coordinator.rs::is_whisper_compatible_provider` 加同名 id；
+//      若是专有协议，新增独立 ASR client 与 provider kind；
 //   3. 在 i18n 的 `settings.providers.presets.<nameKey>` 加文案。
 // `AsrPresetId` 定义在 settings/shared.tsx，LocalModelSection / ProvidersSection 共用同一份。
 const ASR_PRESETS: ReadonlyArray<{ id: AsrPresetId; nameKey: string; baseUrl: string; model: string }> = [
@@ -142,16 +159,31 @@ const ASR_PRESETS: ReadonlyArray<{ id: AsrPresetId; nameKey: string; baseUrl: st
   { id: 'zhipu',        nameKey: 'asrZhipu',        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',           model: 'glm-asr-2512'                },
   { id: 'groq',         nameKey: 'asrGroq',         baseUrl: 'https://api.groq.com/openai/v1',                 model: 'whisper-large-v3-turbo'      },
   { id: 'whisper',      nameKey: 'asrWhisper',      baseUrl: 'https://api.openai.com/v1',                      model: 'whisper-1'                   },
+  // OpenRouter 的 /audio/transcriptions 走 application/json + base64（issue #582），
+  // 后端 coordinator.rs::whisper_request_format 对该 id 切换到 OpenRouterJson 编码。
+  { id: 'openrouter',   nameKey: 'asrOpenrouter',   baseUrl: 'https://openrouter.ai/api/v1',                   model: 'openai/whisper-large-v3-turbo' },
+  // 小米 MiMo ASR 按官方文档走 /chat/completions + input_audio，不是
+  // Whisper /audio/transcriptions；后端由 asr/mimo.rs 专用 client 处理。
+  { id: 'xiaomi-mimo-asr', nameKey: 'asrXiaomiMimo', baseUrl: 'https://api.xiaomimimo.com/v1',                  model: 'mimo-v2.5-asr'               },
   { id: 'foundry-local-whisper', nameKey: 'asrFoundryLocalWhisper', baseUrl: '',                              model: ''                              },
   // 本地引擎（Foundry / sherpa-onnx / Qwen3）：无 baseUrl/model 配置，
   // 模型在「高级 → 本地模型」里下载与切换。
   { id: 'sherpa-onnx-local',     nameKey: 'asrSherpaOnnxLocal',     baseUrl: '',                              model: ''                              },
   { id: 'local-qwen3',  nameKey: 'asrLocalQwen3',   baseUrl: '',                                              model: ''                              },
+  // Apple 系统语音识别（macOS）：无 baseUrl/model、无下载、无凭据。
+  { id: 'apple-speech', nameKey: 'asrAppleSpeech',  baseUrl: '',                                              model: ''                              },
 ];
 
-export function ProvidersSection() {
+type ProvidersSectionKind = 'all' | 'llm' | 'asr';
+
+interface ProvidersSectionProps {
+  kind?: ProvidersSectionKind;
+}
+
+export function ProvidersSection({ kind = 'all' }: ProvidersSectionProps = {}) {
   const { t } = useTranslation();
   const { prefs, updatePrefs } = useHotkeySettings();
+  const mobile = useMobileLayout();
   // `*Provider` 立即跟随 <select> 改动（受控组件必须实时反映用户输入）；
   // `committed*Provider` 才决定 CredentialField 的 key，仅在后端 active
   // 切换 + 默认值写完后再 commit。两者拆开是为了同时满足：
@@ -168,12 +200,14 @@ export function ProvidersSection() {
   const [llmModelRevision, setLlmModelRevision] = useState(0);
   const [asrModelRevision, setAsrModelRevision] = useState(0);
   const os = detectOS();
-  // 主 ASR 下拉只列云端选项；本地推理（local-qwen3 / foundry-local-whisper /
-  // sherpa-onnx-local）移到「高级 → 本地模型」，防止新手误开 CPU 推理。
+  // 本地重引擎（qwen3 / sherpa / foundry）仍只在「高级 → 本地模型」里启用，
+  // 防止新手在主下拉误开 CPU 推理。Apple 语音是系统自带、零凭据、轻量，
+  // 在 macOS 上直接作为常规选项放进主下拉，方便随时选用 / 切走。
   const visibleAsrPresets = ASR_PRESETS.filter(
     p => p.id !== 'foundry-local-whisper'
       && p.id !== 'local-qwen3'
-      && p.id !== 'sherpa-onnx-local',
+      && p.id !== 'sherpa-onnx-local'
+      && (p.id !== 'apple-speech' || os === 'mac'),
   );
 
   useEffect(() => {
@@ -305,11 +339,16 @@ export function ProvidersSection() {
   const preset = LLM_PRESETS.find(p => p.id === committedLlmProvider) ?? LLM_PRESETS[LLM_PRESETS.length - 1];
   const codexOAuthSelected = committedLlmProvider === 'codex_oauth';
   const asrPreset = visibleAsrPresets.find(p => p.id === committedAsrProvider);
+  const showLlm = kind === 'all' || kind === 'llm';
+  const showAsr = kind === 'all' || kind === 'asr';
   return (
     <>
+      {kind === 'all' && (
       <div style={{ fontSize: 11.5, color: 'var(--ol-ink-4)', lineHeight: 1.6, marginBottom: 10 }}>
         {t('settings.providers.credentialStorageNotice')}
       </div>
+      )}
+      {showLlm && (
       <Card>
         <div style={{ marginBottom: 10 }}>
           <SectionTitle>{t('settings.providers.llmTitle')}</SectionTitle>
@@ -325,7 +364,7 @@ export function ProvidersSection() {
               label: t(`settings.providers.presets.${p.nameKey}`),
             }))}
             ariaLabel={t('settings.providers.providerLabel')}
-            style={{ ...inputStyle, width: '100%', maxWidth: 200 }}
+            style={{ ...inputStyle, width: '100%', maxWidth: mobile ? '100%' : 200 }}
           />
         </SettingRow>
         {codexOAuthSelected ? (
@@ -350,7 +389,9 @@ export function ProvidersSection() {
         />
         <ProviderTools key={committedLlmProvider} kind="llm" modelAccount="ark.model_id" onModelSelected={() => setLlmModelRevision(v => v + 1)} />
       </Card>
+      )}
 
+      {showAsr && (
       <Card>
         <div style={{ marginBottom: 10 }}>
           <SectionTitle>{t('settings.providers.asrTitle')}</SectionTitle>
@@ -359,47 +400,44 @@ export function ProvidersSection() {
             未激活时不显示提示。 */}
         <SettingRow label={t('settings.providers.providerLabel')}>
           {(() => {
-            const isLocked =
-              committedAsrProvider === 'local-qwen3' ||
-              committedAsrProvider === 'foundry-local-whisper' ||
-              committedAsrProvider === 'sherpa-onnx-local';
-            const selectedValue: AsrPresetId = isLocked ? committedAsrProvider : asrProvider;
-            // 跨机器同步异常兜底：committed 是本地但不在 visibleAsrPresets 里时，受控
-            // select 会回退到首项造成假象 —— 补一个 disabled option 让 select 找到当前值。
-            const anomalousLocal: AsrPresetId | null =
-              isLocked && !visibleAsrPresets.some(p => p.id === committedAsrProvider)
+            // 本地引擎激活时不再「接管 / 锁死」下拉——下拉始终可用，用户在本页就能直接
+            // 切到其它供应商；切走后端 active 即自动停用本地引擎，不必再进「高级」手动关。
+            // 重引擎（qwen3 / sherpa / foundry）当前激活但不在主下拉里时，补一个可选 option
+            // 让 select 显示当前值并允许切走。Apple 语音在 macOS 已是常规可选项。
+            const hiddenLocalActive: AsrPresetId | null =
+              !visibleAsrPresets.some(p => p.id === committedAsrProvider)
                 ? committedAsrProvider
                 : null;
-            const anomalousNameKey = anomalousLocal === 'local-qwen3'
+            const hiddenLocalNameKey = hiddenLocalActive === 'local-qwen3'
               ? 'asrLocalQwen3'
-              : anomalousLocal === 'foundry-local-whisper'
+              : hiddenLocalActive === 'foundry-local-whisper'
                 ? 'asrFoundryLocalWhisper'
-                : anomalousLocal === 'sherpa-onnx-local'
+                : hiddenLocalActive === 'sherpa-onnx-local'
                   ? 'asrSherpaOnnxLocal'
-                  : null;
+                  : hiddenLocalActive === 'apple-speech'
+                    ? 'asrAppleSpeech'
+                    : null;
             return (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start', minWidth: 0 }}>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: mobile ? 'stretch' : 'flex-start', minWidth: 0, width: '100%', maxWidth: '100%' }}>
                 <SelectLite
-                  value={selectedValue}
-                  disabled={isLocked}
+                  value={asrProvider}
                   onChange={next => onAsrProviderChange(next as AsrPresetId)}
                   options={[
                     ...visibleAsrPresets.map(p => ({
                       value: p.id,
                       label: t(`settings.providers.presets.${p.nameKey}`),
                     })),
-                    ...(anomalousLocal && anomalousNameKey
+                    ...(hiddenLocalActive && hiddenLocalNameKey
                       ? [{
-                          value: anomalousLocal,
-                          label: t(`settings.providers.presets.${anomalousNameKey}`),
-                          disabled: true,
+                          value: hiddenLocalActive,
+                          label: t(`settings.providers.presets.${hiddenLocalNameKey}`),
                         }]
                       : []),
                   ]}
                   ariaLabel={t('settings.providers.providerLabel')}
-                  style={{ ...inputStyle, width: '100%', maxWidth: 200 }}
+                  style={{ ...inputStyle, width: '100%', maxWidth: mobile ? '100%' : 200 }}
                 />
-                {isLocked && (
+                {hiddenLocalActive && (
                   <div style={{ fontSize: 11, color: 'var(--ol-ink-4)', lineHeight: 1.5 }}>
                     {t('settings.providers.asrProviderTakenOver')}
                   </div>
@@ -434,7 +472,7 @@ export function ProvidersSection() {
               {t('settings.providers.volcengineMappingNote')}
             </div>
           </>
-        ) : committedAsrProvider === 'local-qwen3' || committedAsrProvider === 'foundry-local-whisper' || committedAsrProvider === 'sherpa-onnx-local' ? (
+        ) : committedAsrProvider === 'local-qwen3' || committedAsrProvider === 'foundry-local-whisper' || committedAsrProvider === 'sherpa-onnx-local' || committedAsrProvider === 'apple-speech' ? (
           // 用户已经在用本地 ASR——dropdown 行的 asrProviderTakenOver 已经把
           // "在高级中切换或禁用"讲清楚了，body 不再重复。
           // 模型管理 UI 唯一入口在「高级 → 本地模型」里的 <LocalAsr embedded />。
@@ -465,6 +503,7 @@ export function ProvidersSection() {
           </>
         )}
       </Card>
+      )}
     </>
   );
 }
@@ -473,6 +512,7 @@ type ProviderToolStatus = 'idle' | 'loading' | 'success' | 'empty' | 'error';
 
 function ProviderTools({ kind, modelAccount, onModelSelected }: { kind: 'llm' | 'asr'; modelAccount: string; onModelSelected: () => void }) {
   const { t } = useTranslation();
+  const mobile = useMobileLayout();
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState('');
   const [status, setStatus] = useState<ProviderToolStatus>('idle');
@@ -538,8 +578,8 @@ function ProviderTools({ kind, modelAccount, onModelSelected }: { kind: 'llm' | 
 
   return (
     <SettingRow label={t('settings.providers.toolsLabel')}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: 420 }}>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8, width: '100%', maxWidth: mobile ? '100%' : 420 }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', width: '100%' }}>
           <button onClick={validate} style={miniBtnStyle} disabled={status === 'loading'}>{t('settings.providers.validate')}</button>
           <button onClick={loadModels} style={miniBtnStyle} disabled={status === 'loading'}>{t('settings.providers.fetchModels')}</button>
           {models.length > 0 && (
@@ -550,7 +590,7 @@ function ProviderTools({ kind, modelAccount, onModelSelected }: { kind: 'llm' | 
               options={models.map(model => ({ value: model, label: model }))}
               placeholder={t('settings.providers.selectModel')}
               ariaLabel={t('settings.providers.selectModel')}
-              style={{ ...inputStyle, maxWidth: 220 }}
+              style={{ ...inputStyle, flex: mobile ? '1 1 100%' : '1 1 180px', maxWidth: mobile ? '100%' : 220 }}
             />
           )}
         </div>
@@ -597,6 +637,7 @@ interface CredentialFieldProps {
 
 function CredentialField({ label, account, placeholder, mono, mask, defaultValue, trailing }: CredentialFieldProps) {
   const { t } = useTranslation();
+  const mobile = useMobileLayout();
   const [value, setValue] = useState('');
   const [revealed, setRevealed] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -604,6 +645,7 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
   const [status, setStatus] = useState<CredentialFieldStatus>('idle');
   const debounceRef = useRef<number | null>(null);
   const statusRef = useRef<number | null>(null);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -633,7 +675,9 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
   }, [account]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (debounceRef.current) clearTimeout(debounceRef.current);
       if (statusRef.current) clearTimeout(statusRef.current);
     };
@@ -661,13 +705,16 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
 
   const save = async (v: string, force = false) => {
     if (!loaded || (!dirty && !force)) return;
+    if (!mountedRef.current) return;
     setStatus('saving');
     emitSaved('saving', t('common.saving'));
     try {
       await setCredential(account, v);
+      if (!mountedRef.current) return;
       setDirty(false);
       showTemporaryStatus('saved');
     } catch (error) {
+      if (!mountedRef.current) return;
       console.error('[settings] failed to save credential', account, error);
       showTemporaryStatus('saveError');
     }
@@ -688,7 +735,7 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
       clearTimeout(debounceRef.current);
       debounceRef.current = null;
     }
-    save(value, true);
+    void save(value, true);
   };
 
   const fillDefault = async () => {
@@ -719,8 +766,8 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
 
   return (
     <SettingRow label={label}>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, width: '100%', maxWidth: 420 }}>
-        <div style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 5, width: '100%', maxWidth: mobile ? '100%' : 420 }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', width: '100%', flexWrap: mobile ? 'wrap' : 'nowrap' }}>
           <input
             type={inputType}
             value={value}
@@ -728,7 +775,7 @@ function CredentialField({ label, account, placeholder, mono, mask, defaultValue
             onChange={handleChange}
             onBlur={onBlur}
             disabled={disabled}
-            style={{ ...inputStyle, fontFamily: mono ? 'var(--ol-font-mono)' : 'inherit' }}
+            style={{ ...inputStyle, flex: mobile ? '1 1 180px' : 1, minWidth: 0, maxWidth: '100%', fontFamily: mono ? 'var(--ol-font-mono)' : 'inherit' }}
           />
           {defaultValue && !value && loaded && (
             <button onClick={fillDefault} title={t('settings.providers.fillDefault')} style={iconBtnStyle} disabled={!loaded}>

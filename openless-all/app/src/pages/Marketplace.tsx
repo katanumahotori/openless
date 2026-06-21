@@ -12,7 +12,6 @@
 // dev 上传需要 prefs.marketplaceDevLogin（GitHub login 风格）—— 空时上传按钮 disabled。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useAutoAnimate } from '@formkit/auto-animate/react';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import { Icon } from '../components/Icon';
@@ -43,7 +42,6 @@ type SortMode = 'popular' | 'new' | 'liked';
 export function Marketplace() {
   const { t } = useTranslation();
   const { prefs, updatePrefs } = useHotkeySettings();
-  const [listRef] = useAutoAnimate<HTMLDivElement>({ duration: 300, easing: 'cubic-bezier(0.175, 0.885, 0.32, 1.275)' });
 
   // 启动时尝试读缓存：上次默认视图（popular + 空 query）的列表，秒呈现。后台 refresh 校准。
   const [items, setItems] = useState<MarketplaceListItem[]>(() => readMarketplaceListCache() ?? []);
@@ -56,7 +54,6 @@ export function Marketplace() {
   const [detail, setDetail] = useState<MarketplaceDetail | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [actionMsg, setActionMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
-  const dismissActionMsg = useCallback(() => setActionMsg(null), []);
 
   const [showUpload, setShowUpload] = useState(false);
   const [uploadOriginPackId, setUploadOriginPackId] = useState<string | null>(null);
@@ -386,8 +383,9 @@ export function Marketplace() {
       setUploadOriginPackId(null);
       setUploadTargetName(null);
       setSelectedUploadPackId(null);
-      // 后续 polling 用服务端真实数据校准（审核状态可能 pending→approved/rejected）。
-      window.setTimeout(() => { void refresh(); void refreshMyPacks(); }, 1500);
+      // issue #470：上传后给后端一点时间落库 + 跑审核，再用服务端真实数据校准一次
+      // （审核状态可能 pending→approved/rejected）。乐观更新已即时反映「我的发布」，
+      // 这里只需单次兜底刷新；取较长延时（5s）确保后端最终一致后能查到，去掉冗余的 1.5s 那次。
       window.setTimeout(() => { void refresh(); void refreshMyPacks(); }, 5000);
     } catch (error) {
       setActionMsg({ kind: 'err', text: t('marketplace.errors.upload', { err: errorMessage(error) }) });

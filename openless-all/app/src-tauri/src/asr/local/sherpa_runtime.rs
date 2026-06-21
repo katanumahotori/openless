@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables)]
 //! sherpa-onnx 本地 ASR runtime（Windows offline batch + online streaming）。
 //!
 //! 设计与 `foundry_runtime.rs` 对齐：runtime 是模型/会话/生命周期的单一持有者，
@@ -484,7 +485,7 @@ fn accumulate_dir_size(dir: &Path, bytes: &mut u64) {
 }
 
 fn pcm_duration_ms(pcm: &[u8]) -> u64 {
-    (pcm.len() as u64 / 2) * 1000 / 16_000
+    crate::asr::pcm::pcm_duration_ms(pcm)
 }
 
 enum LoadedModel {

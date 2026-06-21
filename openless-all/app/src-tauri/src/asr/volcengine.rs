@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "linux", allow(dead_code, unused_variables))]
 //! Volcengine SAUC bigmodel streaming ASR client.
 //!
 //! Direct port of the Swift `VolcengineStreamingASR`. Battle-tested protocol
@@ -56,8 +57,6 @@ pub enum VolcengineASRError {
     /// 文案简短，原因在文档里说明，capsule 不堆长引导。
     #[error("凭据被拒（{0}）")]
     AuthRejected(u16),
-    #[error("authentication failed")]
-    AuthenticationFailed,
     #[error("no final result")]
     NoFinalResult,
     #[error("final result timed out")]
@@ -123,10 +122,6 @@ impl VolcengineStreamingASR {
         }
     }
 
-    pub fn is_connected(&self) -> bool {
-        self.state.lock().is_connected
-    }
-
     pub async fn open_session(self: &Arc<Self>) -> Result<(), VolcengineASRError> {
         if self.credentials.app_id.is_empty()
             || self.credentials.access_token.is_empty()
@@ -161,7 +156,9 @@ impl VolcengineStreamingASR {
                 .map_err(|e| VolcengineASRError::ConnectionFailed(e.to_string()))?,
         );
 
-        let (ws, _resp) = connect_async(request).await.map_err(classify_connect_error)?;
+        let (ws, _resp) = connect_async(request)
+            .await
+            .map_err(classify_connect_error)?;
         let (write, read) = ws.split();
 
         let (tx, rx) = oneshot::channel();

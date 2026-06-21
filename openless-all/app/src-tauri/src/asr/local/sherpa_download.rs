@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -105,6 +106,10 @@ impl SherpaDownloadManager {
         } else {
             log::info!("[sherpa-asr] 请求取消模型下载，但没有活跃任务: {model_alias}");
         }
+    }
+
+    pub fn is_active(&self, model_alias: &str) -> bool {
+        self.cancel_flags.lock().contains_key(model_alias)
     }
 }
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { detectOS, type OS } from './WindowChrome';
 import {
@@ -6,9 +6,42 @@ import {
   getCapsuleMessageLayout,
   getCapsulePillMetrics,
 } from '../lib/capsuleLayout';
-import { getSettings, invokeOrMock, isTauri } from '../lib/ipc';
-import { playRecordStartCue, stopAudioCue } from '../lib/audioCue';
-import type { CapsulePayload, CapsuleState, UserPreferences } from '../lib/types';
+import { invokeOrMock, isTauri } from '../lib/ipc';
+import type { CapsulePayload, CapsuleState } from '../lib/types';
+
+// 胶囊 keyframes 注入一次到 document.head，而不是放在组件 JSX 里。否则录音时音量
+// 每帧（~60Hz）setLevel 都会让 React 重新创建/reconcile 这个 <style> 元素 —— 纯属
+// 浪费，因为这些 keyframes 是静态的。与 QaPanel / LessComputerPanel 注入方式一致。
+const CAPSULE_KEYFRAMES = `
+  /* 入场：从中央很窄的一小条（scaleX 0.18）+ 略压扁（scaleY 0.95）+ 透明，
+     长出到 scaleX 1 / scaleY 1 / 不透明。配合 wrapper 的 transformOrigin:center，
+     视觉上是「从中心向左右展开」。 */
+  @keyframes capsule-in {
+    from { opacity: 0; transform: scale(.78) translateY(8px); }
+    to   { opacity: 1; transform: scale(1)   translateY(0); }
+  }
+  /* 离场：scaleX 由 1 收回 0.18 + 整体向下偏移 8px + 淡出。
+     forwards 让最终帧（opacity:0、scaleX:.18）保持到组件被卸载。 */
+  @keyframes capsule-out {
+    from { opacity: 1; transform: scaleX(1)   translateY(0); }
+    to   { opacity: 0; transform: scaleX(.18) translateY(8px); }
+  }
+  @keyframes cap-shine {
+    0%   { background-position: 200% center; }
+    100% { background-position: -200% center; }
+  }
+  @keyframes cap-state-enter {
+    from { opacity: 0; transform: translateY(2px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+`;
+
+if (typeof document !== 'undefined' && !document.getElementById('capsule-keyframes')) {
+  const tag = document.createElement('style');
+  tag.id = 'capsule-keyframes';
+  tag.textContent = CAPSULE_KEYFRAMES;
+  document.head.appendChild(tag);
+}
 
 interface AudioBarsProps {
   level: number;
@@ -64,7 +97,7 @@ interface CenterTextProps {
   color?: string;
 }
 
-function CenterText({ os, kind, text, color = 'var(--ol-ink-3)' }: CenterTextProps) {
+function CenterText({ os, kind, text, color = 'var(--ol-capsule-center-ink)' }: CenterTextProps) {
   const metrics = getCapsulePillMetrics(os);
   const layout = getCapsuleMessageLayout(os, kind);
   return (
@@ -97,25 +130,27 @@ interface CircleButtonProps {
   onClick: () => void;
 }
 
-function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
+// memo:录音时 level 每帧(~60Hz)变化会重渲 Pill;cancel/confirm 两个 SVG 按钮跟
+// level 无关,memo + 稳定的 onClick 让它们在录音期间跳过重渲(只剩音量条真正更新)。
+const CircleButton = memo(function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
   const { t } = useTranslation();
   const isCancel = variant === 'cancel';
-  // confirm 是主操作锚点，纯白；cancel 半透 + 自带 backdrop blur 跟 pill 拉开层级。
-  const useBackdrop = isCancel;
   return (
     <button
       onClick={enabled ? onClick : undefined}
+      onMouseDown={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }}
       aria-label={isCancel ? t('common.cancel') : t('settings.shortcuts.confirm')}
       disabled={!enabled}
       style={{
         width: 28,
         height: 28,
         borderRadius: 999,
-        background: isCancel ? 'rgba(255, 255, 255, 0.55)' : 'rgba(255, 255, 255, 0.92)',
-        backdropFilter: useBackdrop ? 'blur(12px) saturate(160%)' : 'none',
-        WebkitBackdropFilter: useBackdrop ? 'blur(12px) saturate(160%)' : 'none',
-        color: 'var(--ol-ink)',
-        border: '0.8px solid rgba(0, 0, 0, 0.08)',
+        background: isCancel ? 'var(--ol-capsule-btn-bg)' : 'var(--ol-capsule-btn-bg-confirm)',
+        color: 'var(--ol-capsule-btn-ink)',
+        border: '0.8px solid var(--ol-capsule-btn-border)',
         display: 'inline-flex',
         alignItems: 'center',
         justifyContent: 'center',
@@ -139,7 +174,7 @@ function CircleButton({ variant, enabled, onClick }: CircleButtonProps) {
       )}
     </button>
   );
-}
+});
 
 interface PillProps {
   os: OS;
@@ -147,15 +182,17 @@ interface PillProps {
   level: number;
   insertedChars: number;
   message?: string;
+  operating?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }
 
-function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }: PillProps) {
+function Pill({ os, state, level, insertedChars, message, operating, onCancel, onConfirm }: PillProps) {
   const { t } = useTranslation();
-  const metrics = getCapsulePillMetrics(os);
-  const processingLayout = getCapsuleMessageLayout(os, 'processing');
-  const enabled = state === 'recording';
+  const metrics = useMemo(() => getCapsulePillMetrics(os), [os]);
+  const processingLayout = useMemo(() => getCapsuleMessageLayout(os, 'processing'), [os]);
+  const cancelEnabled = state === 'recording' || state === 'transcribing' || state === 'polishing';
+  const confirmEnabled = state === 'recording';
 
   // "thinking" 扫光速度：进入 transcribing/polishing 的头 2 秒走快速（0.9s/cycle，提示
   // 「流式刚开始」），之后切回慢速（2.4s）作为稳态。切回 idle / done / 其他 state 也复位
@@ -225,7 +262,7 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
               WebkitLineClamp: processingLayout.lineClamp,
             }}
           >
-            {t('capsule.thinking')}
+            {t(operating ? 'capsule.using' : 'capsule.thinking')}
           </span>
         </div>
       );
@@ -248,10 +285,10 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
   const shadowAlpha = 0.20 + ambient * 0.10;
 
   return (
-    // 假毛玻璃：半透明白底 + .ol-frost 噪点纹理 + 内描边高光 + 柔和阴影。
+    // 非 Linux 走假毛玻璃；Linux 禁用透明窗口后由 .ol-frost 平台规则退成不透明面。
     // 不写 backdrop-filter —— webview 模糊不了透明窗口背后的桌面（Tauri 上游限制）。
     <div
-      className="ol-frost"
+      className="ol-frost ol-capsule-pill"
       style={{
         display: 'inline-flex',
         alignItems: 'center',
@@ -262,11 +299,9 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
         height: metrics.height,
         boxSizing: metrics.boxSizing,
         borderRadius: 999,
-        border: '1px solid rgba(255, 255, 255, 0.55)',
-        boxShadow: os === 'win'
-          ? `0 10px 24px -14px rgba(0, 0, 0, ${(0.24 + ambient * 0.06).toFixed(3)}), 0 0 0 0.5px rgba(0, 0, 0, 0.08), inset 0 1px 0 0 rgba(255, 255, 255, 0.8)`
-          : `0 18px 50px -10px rgba(0, 0, 0, ${shadowAlpha.toFixed(3)}), 0 0 0 0.5px rgba(0, 0, 0, 0.08), inset 0 1px 0 0 rgba(255, 255, 255, 0.8)`,
-        color: 'var(--ol-ink)',
+        border: '1px solid var(--ol-capsule-pill-border)',
+        boxShadow: `${os === 'win' ? `0 10px 24px -14px rgba(0, 0, 0, ${(0.24 + ambient * 0.06).toFixed(3)})` : `0 18px 50px -10px rgba(0, 0, 0, ${shadowAlpha.toFixed(3)})`}, 0 0 0 0.5px rgba(0, 0, 0, 0.24), var(--ol-capsule-pill-inset)`,
+        color: 'var(--ol-capsule-center-ink)',
         fontFamily: 'var(--ol-font-sans)',
         transform: `scale(${scale.toFixed(4)})`,
         transformOrigin: 'center',
@@ -274,11 +309,11 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
         willChange: 'transform, box-shadow',
       }}
     >
-      <CircleButton variant="cancel" enabled={enabled} onClick={onCancel} />
+      <CircleButton variant="cancel" enabled={cancelEnabled} onClick={onCancel} />
       <div style={{ flex: 1, minWidth: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         {center}
       </div>
-      <CircleButton variant="confirm" enabled={enabled} onClick={onConfirm} />
+      <CircleButton variant="confirm" enabled={confirmEnabled} onClick={onConfirm} />
     </div>
   );
 }
@@ -287,6 +322,9 @@ function Pill({ os, state, level, insertedChars, message, onCancel, onConfirm }:
 // 动画结束就 unmount → 用户看到半截动画被截断。
 // v1.3.1-6: 从 240ms 加到 360ms 让用户看清退出动画（240ms 太快感知不到）。
 const EXIT_ANIM_MS = 360;
+// #470 诊断 v2：模块级一次性门，只在 webview 收到第一个 capsule:state 事件时打 log。
+let capsuleStateFirstLogged = false;
+
 // 初始可见 state：Tauri 内运行从 idle 开始（等后端 capsule:state 事件），
 // 浏览器 dev 模式从 recording 开始以便直接看到胶囊。
 const INITIAL_VISIBLE_STATE: CapsuleState = isTauri ? 'idle' : 'recording';
@@ -300,6 +338,7 @@ export function Capsule() {
   const [insertedChars, setInsertedChars] = useState<number>(0);
   const [message, setMessage] = useState<string | undefined>();
   const [translation, setTranslation] = useState<boolean>(false);
+  const [operating, setOperating] = useState<boolean>(false);
   // `leaving` 与 `lastVisibleState` 协同实现「退出动画」：
   // - 当 state 从非 idle 变成 idle 时，不立即卸载，而是把 leaving 置为 true 并保留
   //   最后一帧的可见 state（lastVisibleState），让胶囊用 capsule-out 动画收缩淡出。
@@ -309,10 +348,6 @@ export function Capsule() {
   const [lastVisibleState, setLastVisibleState] = useState<CapsuleState>(INITIAL_VISIBLE_STATE);
   // Windows 端 host 在翻译模式从 84 长到 118；macOS / Linux 上 capsuleLayout 已固定 42 忽略此参数。
   const hostMetrics = getCapsuleHostMetrics(os, translation);
-  // 录音提示音：是否开启（默认 true，老配置缺字段也按开启）+ 上一帧 capsule 状态，
-  // 用于检测「进入 recording」这条边沿。用 ref 而非 state：提示音是副作用，不该触发重渲染。
-  const audioCueEnabledRef = useRef<boolean>(true);
-  const prevStateRef = useRef<CapsuleState>(INITIAL_VISIBLE_STATE);
 
   useEffect(() => {
     if (!isTauri) return;
@@ -322,11 +357,18 @@ export function Capsule() {
       const { listen } = await import('@tauri-apps/api/event');
       const handle = await listen<CapsulePayload>('capsule:state', event => {
         const p = event.payload;
+        if (!capsuleStateFirstLogged) {
+          capsuleStateFirstLogged = true;
+          // #470 诊断 v2：确认 capsule webview 确实收到了后端事件 —— 区分「后端没
+          // emit」与「emit 了但窗口没显示/没渲染」。配合后端 [capsule] 日志定位根因。
+          console.info('[capsule] first capsule:state received in webview, state=', p.state);
+        }
         setState(p.state);
         setLevel(p.level ?? 0);
         setMessage(p.message ?? undefined);
         if (p.insertedChars != null) setInsertedChars(p.insertedChars);
         setTranslation(p.translation === true);
+        setOperating(p.operating === true);
       });
       if (cancelled) handle();
       else unlisten = handle;
@@ -336,49 +378,6 @@ export function Capsule() {
       if (unlisten) unlisten();
     };
   }, []);
-
-  // 读取「录音提示音」开关并跟随设置实时更新：capsule 窗口不在 HotkeySettingsProvider 下，
-  // 所以这里自己拉一次 getSettings()，再订阅 prefs:changed 保持同步。缺字段按默认开启。
-  useEffect(() => {
-    if (!isTauri) return;
-    let cancelled = false;
-    let unlisten: (() => void) | undefined;
-    (async () => {
-      try {
-        const prefs = await getSettings();
-        if (!cancelled) audioCueEnabledRef.current = prefs.audioCueOnRecord !== false;
-      } catch (err) {
-        console.warn('[capsule] read audioCueOnRecord failed; default on', err);
-      }
-      const { listen } = await import('@tauri-apps/api/event');
-      const handle = await listen<UserPreferences>('prefs:changed', event => {
-        const next = event.payload;
-        if (next) audioCueEnabledRef.current = next.audioCueOnRecord !== false;
-      });
-      if (cancelled) handle();
-      else unlisten = handle;
-    })().catch(err => {
-      // import / listen 早期失败（Tauri IPC 尚未就绪）不能变成 unhandled rejection。
-      console.warn('[capsule] audio-cue prefs listener init failed', err);
-    });
-    return () => {
-      cancelled = true;
-      if (unlisten) unlisten();
-    };
-  }, []);
-
-  // 提示音触发：检测 capsule 状态进入 recording 的边沿就播放（提醒「已开始录音」）；
-  // 离开 recording 则停掉，避免连按热键时残留尾音。独立于 showCapsule —— 胶囊隐藏也会响。
-  useEffect(() => {
-    const prev = prevStateRef.current;
-    prevStateRef.current = state;
-    if (!isTauri) return;
-    if (state === 'recording' && prev !== 'recording') {
-      if (audioCueEnabledRef.current) playRecordStartCue();
-    } else if (state !== 'recording' && prev === 'recording') {
-      stopAudioCue();
-    }
-  }, [state]);
 
   // 退出动画调度：在 state 真正进入 idle 时，先用 capsule-out 播放 EXIT_ANIM_MS，再卸载。
   // 设计要点：
@@ -406,13 +405,13 @@ export function Capsule() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state]);
 
-  const onCancel = () => {
+  const onCancel = useCallback(() => {
     void invokeOrMock<void>('cancel_dictation', undefined, () => undefined);
-  };
+  }, []);
 
-  const onConfirm = () => {
+  const onConfirm = useCallback(() => {
     void invokeOrMock<void>('stop_dictation', undefined, () => undefined);
-  };
+  }, []);
 
   // 真正卸载：state 已是 idle，且不在离场动画中。
   if (state === 'idle' && !leaving) {
@@ -449,7 +448,8 @@ export function Capsule() {
           // - 出场 .24s → .36s（前面 EXIT_ANIM_MS 也同步到 360），曲线改成 ease-in-out 平滑
           //   收缩 + 下移 + 淡出三段同步进行
           ? 'capsule-out .36s cubic-bezier(.55,.06,.68,.19) forwards'
-          : 'capsule-in .38s cubic-bezier(.16,.86,.32,1.18) both',
+          // 入场改成弹性"弹出"：整体 scale 从 .78 弹到 1，back-out 曲线带回弹 overshoot。
+          : 'capsule-in .46s cubic-bezier(.34,1.56,.64,1) both',
         transformOrigin: 'center',
         willChange: 'transform, opacity',
       }}
@@ -481,10 +481,10 @@ export function Capsule() {
             fontSize: 10.5,
             fontWeight: 600,
             color: 'var(--ol-blue)',
-            background: 'rgba(255, 255, 255, 0.78)',
-            backdropFilter: 'blur(20px) saturate(180%)',
-            WebkitBackdropFilter: 'blur(20px) saturate(180%)',
-            border: '0.5px solid rgba(37, 99, 235, 0.25)',
+            background: 'var(--ol-capsule-badge-bg)',
+            // issue #470：去掉无效的 backdrop-filter —— webview 模糊不了透明窗口背后的桌面
+            // （Tauri 上游限制，同本文件上方 pill 注释），纯空耗合成，删除零视觉变化。
+            border: '0.5px solid var(--ol-capsule-badge-border)',
             boxShadow: '0 4px 12px -4px rgba(37, 99, 235, 0.25), 0 0 0 0.5px rgba(0,0,0,0.04)',
             letterSpacing: '0.02em',
             whiteSpace: 'nowrap',
@@ -506,32 +506,10 @@ export function Capsule() {
         level={leaving ? 0 : level}
         insertedChars={insertedChars}
         message={message}
+        operating={operating}
         onCancel={onCancel}
         onConfirm={onConfirm}
       />
-      <style>{`
-        /* 入场：从中央很窄的一小条（scaleX 0.18）+ 略压扁（scaleY 0.95）+ 透明，
-           长出到 scaleX 1 / scaleY 1 / 不透明。配合 wrapper 的 transformOrigin:center，
-           视觉上是「从中心向左右展开」。 */
-        @keyframes capsule-in {
-          from { opacity: 0; transform: scaleX(.18) scaleY(.95); }
-          to   { opacity: 1; transform: scaleX(1)   scaleY(1); }
-        }
-        /* 离场：scaleX 由 1 收回 0.18 + 整体向下偏移 8px + 淡出。
-           forwards 让最终帧（opacity:0、scaleX:.18）保持到组件被卸载。 */
-        @keyframes capsule-out {
-          from { opacity: 1; transform: scaleX(1)   translateY(0); }
-          to   { opacity: 0; transform: scaleX(.18) translateY(8px); }
-        }
-        @keyframes cap-shine {
-          0%   { background-position: 200% center; }
-          100% { background-position: -200% center; }
-        }
-        @keyframes cap-state-enter {
-          from { opacity: 0; transform: translateY(2px); }
-          to   { opacity: 1; transform: translateY(0); }
-        }
-      `}</style>
     </div>
   );
 }

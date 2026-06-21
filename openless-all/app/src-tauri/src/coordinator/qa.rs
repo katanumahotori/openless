@@ -8,7 +8,7 @@ use crate::types::CapsuleState;
 
 use super::{
     begin_qa_session, cancel_qa_session, capture_focus_target, capture_frontmost_app, emit_capsule,
-    end_qa_session, Inner,
+    end_qa_session, qa_event_target, Inner,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +108,7 @@ pub(super) fn open_qa_panel(inner: &Arc<Inner>) {
     if let Some(app) = inner.app.lock().clone() {
         crate::show_qa_window(&app, "idle");
         let _ = app.emit_to(
-            "qa",
+            qa_event_target(),
             "qa:state",
             serde_json::json!({
                 "kind": "idle",
@@ -138,4 +138,25 @@ pub(super) fn close_qa_panel(inner: &Arc<Inner>) {
     // 胶囊一同收掉，避免浮窗关了胶囊还在显示。
     emit_capsule(inner, CapsuleState::Idle, 0.0, 0, None, None);
     log::info!("[coord] QA panel closed, history cleared");
+}
+
+#[cfg(test)]
+mod tests {
+    // issue #609 F-05：给零覆盖的纯逻辑补单测。QaSessionState::default() 的初始不变量
+    // 是 open/close panel、begin/end session 一系列状态机的起点，任何字段默认值漂移
+    // （如 panel_visible 默认 true、messages 非空）都会让 QA 流程行为错乱。
+    use super::{QaPhase, QaSessionState};
+
+    #[test]
+    fn qa_session_state_default_starts_idle_and_clean() {
+        let st = QaSessionState::default();
+        assert_eq!(st.phase, QaPhase::Idle);
+        assert!(!st.cancelled);
+        assert!(st.selection.is_none());
+        assert!(st.front_app.is_none());
+        assert!(st.qa_focus_target.is_none());
+        assert!(!st.pinned, "新建会话不应处于 pinned");
+        assert!(!st.panel_visible, "浮窗默认不可见，等用户 toggle");
+        assert!(st.messages.is_empty(), "新建会话历史必须为空");
+    }
 }

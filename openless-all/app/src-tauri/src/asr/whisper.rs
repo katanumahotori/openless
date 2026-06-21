@@ -2,6 +2,7 @@
 //! to any OpenAI-compatible `/audio/transcriptions` endpoint on session end.
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use parking_lot::Mutex;
 
 use crate::asr::wav::encode_wav_16k_mono;
@@ -21,6 +22,19 @@ pub const PROMPT_CHAR_BUDGET: usize = 240;
 /// 区切り文字（ASCII）。Whisper のトークナイザはどの言語でも安定して扱える。
 const PROMPT_SEPARATOR: &str = ", ";
 
+/// `/audio/transcriptions` 请求体编码方式。
+///
+/// OpenAI 官方及多数兼容厂商用 `multipart/form-data`（file + model）。
+/// OpenRouter 虽路径相同、也走 Bearer，但请求体是 `application/json`：
+/// `{model, input_audio:{data:<base64 wav>, format:"wav"}}`（issue #582）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AsrRequestFormat {
+    /// `multipart/form-data`（既有行为，默认）。
+    Multipart,
+    /// OpenRouter `application/json` + base64 音频。
+    OpenRouterJson,
+}
+
 pub struct WhisperBatchASR {
     api_key: String,
     base_url: String,
@@ -30,10 +44,14 @@ pub struct WhisperBatchASR {
     prompt: Option<String>,
     /// OpenAI 互換でもファイル長に上限がある provider 用。None は従来通り一括送信。
     max_chunk_duration_ms: Option<u64>,
-    /// `response_format=verbose_json` を要求してセグメントのメタデータで幻聴を
-    /// 捨てるか。OpenAI / Groq の Whisper のみ true。SiliconFlow（SenseVoice /
-    /// TeleSpeech）は response_format 非対応なので false で従来の json を送る。
+    /// `response_format=verbose_json` を要求してセグメント単位のメタデータ
+    /// （no_speech_prob / avg_logprob / compression_ratio）で幻聴を捨てるか。
+    /// OpenAI / Groq の Whisper は full に対応。SenseVoice / TeleSpeech 等
+    /// （SiliconFlow）は response_format 自体が無いので false にして従来の
+    /// `json` のまま送る（壊さない）。
     verbose_json: bool,
+    /// 请求体编码方式。默认 `Multipart`，OpenRouter 走 `OpenRouterJson`。
+    request_format: AsrRequestFormat,
     buffer: Mutex<Vec<u8>>,
 }
 
@@ -53,14 +71,28 @@ impl WhisperBatchASR {
             prompt,
             max_chunk_duration_ms,
             verbose_json,
+            request_format: AsrRequestFormat::Multipart,
             buffer: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 设置请求体编码方式（默认 `Multipart`）。OpenRouter 需 `OpenRouterJson`。
+    /// 用 builder 而非给 `new()` 加参数，避免改动既有 4 处构造点的签名。
+    pub fn with_request_format(mut self, request_format: AsrRequestFormat) -> Self {
+        self.request_format = request_format;
+        self
     }
 
     /// Stop collecting audio, encode the buffer as WAV, and POST to the
     /// Whisper transcriptions endpoint.
     ///
     /// 失败时**保留** PCM buffer，让上层有机会重试或在历史中至少留一个失败记录；
+    /// 当前缓冲音频时长（毫秒）。Coordinator 在 transcribe() 调用前读取，
+    /// 用于计算 Whisper / OpenRouter 的动态超时。不消费缓冲。
+    pub fn buffer_duration_ms(&self) -> u64 {
+        pcm_duration_ms(&self.buffer.lock())
+    }
+
     /// 之前的实现一进函数就 `mem::take` 把 buffer 清空，凭证错或网络中断都会
     /// 让用户的录音直接消失。
     pub async fn transcribe(&self) -> Result<RawTranscript> {
@@ -108,41 +140,62 @@ impl WhisperBatchASR {
             .collect();
         let wav = encode_wav_16k_mono(&samples);
         let url = transcription_url(&self.base_url)?;
-
-        let wav_part = reqwest::multipart::Part::bytes(wav)
-            .file_name("audio.wav")
-            .mime_str("audio/wav")
-            .context("set MIME type")?;
-        let mut form = reqwest::multipart::Form::new()
-            .part("file", wav_part)
-            .text("model", self.model.clone());
-
-        // verbose_json 対応プロバイダ（OpenAI / Groq）のときだけ要求する。
-        // セグメント単位のメタデータ（no_speech_prob / avg_logprob /
-        // compression_ratio）で幻聴を捨てるため。temperature も 0 固定。
-        // 非対応（SiliconFlow の SenseVoice / TeleSpeech 等）には送らず、
-        // 未知パラメータでの 4xx を避ける。
-        if self.verbose_json {
-            form = form
-                .text("response_format", "verbose_json")
-                .text("temperature", "0");
-        }
-
-        // `prompt` は空文字を送らない：OpenAI 互換実装によっては空文字でエラーに
-        // なるリスクがある（Groq は許容するが防御的にスキップ）。`trim()` で
-        // 空白のみのケースも除外。
-        if let Some(prompt) = self.prompt.as_ref() {
-            let trimmed = prompt.trim();
-            if !trimmed.is_empty() {
-                form = form.text("prompt", trimmed.to_string());
-            }
-        }
-
         let client = reqwest::Client::new();
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
+
+        let request = match self.request_format {
+            AsrRequestFormat::Multipart => {
+                let wav_part = reqwest::multipart::Part::bytes(wav)
+                    .file_name("audio.wav")
+                    .mime_str("audio/wav")
+                    .context("set MIME type")?;
+                let mut form = reqwest::multipart::Form::new()
+                    .part("file", wav_part)
+                    .text("model", self.model.clone());
+
+                // verbose_json 対応プロバイダ（OpenAI / Groq）のときだけ、セグメント
+                // メタデータ付きの応答を要求し、temperature も 0 に固定する。非対応
+                // プロバイダ（SiliconFlow の SenseVoice / TeleSpeech 等）には送らず
+                // 従来どおりの応答にして、未知パラメータでの 4xx を避ける。
+                if self.verbose_json {
+                    form = form
+                        .text("response_format", "verbose_json")
+                        .text("temperature", "0");
+                }
+
+                // `prompt` は空文字を送らない：OpenAI 互換実装によっては空文字でエラーに
+                // なるリスクがある（Groq は許容するが防御的にスキップ）。`trim()` で
+                // 空白のみのケースも除外。
+                if let Some(prompt) = self.prompt.as_ref() {
+                    let trimmed = prompt.trim();
+                    if !trimmed.is_empty() {
+                        form = form.text("prompt", trimmed.to_string());
+                    }
+                }
+
+                client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .multipart(form)
+            }
+            AsrRequestFormat::OpenRouterJson => {
+                // OpenRouter /audio/transcriptions：application/json，音频走标准
+                // base64（带 padding）。不带 multipart 专属的 prompt/response_format
+                // 字段，避免未知字段导致 4xx；verbose_json 对该协议保持关闭。
+                let body = serde_json::json!({
+                    "model": self.model,
+                    "input_audio": {
+                        "data": base64::engine::general_purpose::STANDARD.encode(&wav),
+                        "format": "wav",
+                    },
+                });
+                client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
+                    .json(&body)
+            }
+        };
+
+        let resp = request
             .send()
             .await
             .context("Whisper HTTP request failed")?;
@@ -154,16 +207,13 @@ impl WhisperBatchASR {
         }
 
         let json: serde_json::Value = resp.json().await.context("parse Whisper response")?;
-        // verbose_json のときだけセグメントメタデータで幻聴を除去。非対応
-        // プロバイダは従来どおり text をそのまま使う。
-        let text = if self.verbose_json {
-            extract_confident_text(&json)
+        if self.verbose_json {
+            // verbose_json：セグメントのメタデータで幻聴を除いた本文を組む。
+            // segments が無い応答では内部で従来どおり text にフォールバック。
+            Ok(extract_confident_text(&json))
         } else {
-            json["text"].as_str().unwrap_or("").trim().to_string()
-        };
-        // 辞書プロンプトの echo（ユーザーが言っていない辞書語の羅列）を除去。
-        let text = strip_prompt_echo(&text, self.prompt.as_deref());
-        Ok(text)
+            Ok(json["text"].as_str().unwrap_or("").trim().to_string())
+        }
     }
 
     pub fn cancel(&self) {
@@ -177,24 +227,21 @@ impl crate::recorder::AudioConsumer for WhisperBatchASR {
     }
 }
 
-/// verbose_json レスポンスから、幻聴と思われるセグメントを除いた本文を組む。
+/// verbose_json 应答里去掉「幻听」段落后拼出正文。
 ///
-/// Whisper は無音・小音・ノイズ区間で「もっともらしいが言っていない」テキストを
-/// 生成する既知の欠陥（hallucination）がある。録音の前後の沈黙やマイクのノイズが
-/// 無関係な単語に化けるのがこれ。verbose_json の各セグメントが持つ
-/// `no_speech_prob` / `avg_logprob` / `compression_ratio` を見て、明らかに
-/// 発話でないセグメントを捨てる。
+/// Whisper 在静音 / 弱音 / 噪声段会生成「听起来合理但用户没说」的文本（已知
+/// hallucination 缺陷）：录音前后的沉默或麦克风底噪会变成无关词。verbose_json
+/// 的每个 segment 带 `no_speech_prob` / `avg_logprob` / `compression_ratio`，
+/// 用它们丢掉明显不是真实语音的段落。
 ///
-/// 判定（いずれかに該当したら捨てる）:
-/// - `no_speech_prob > 0.6` かつ `avg_logprob < -0.5`
-///   → 無音確率が高く信頼度も低い。沈黙を作話したセグメント。
-/// - `compression_ratio > 2.4`
-///   → 同一フレーズの反復幻聴（Whisper 標準の閾値）。
-/// - `avg_logprob < -1.0`
-///   → 信頼度が極端に低い。ノイズを単語化したセグメント。
+/// 判定（命中任一即丢弃）：
+/// - `no_speech_prob > 0.6` 且 `avg_logprob < -0.5`：高静音概率且低置信，沉默被作话。
+/// - `compression_ratio > 2.4`：同一短语反复幻听（Whisper 标准阈值）。
+/// - `avg_logprob < -1.0`：置信极低，噪声被词化。
 ///
-/// 実発話を誤って捨てるのが最悪なので、閾値は保守的に設定している。
-/// `segments` が無いレスポンスでは従来どおり `text` をそのまま使う。
+/// 误删真实语音最糟，所以阈值保守。没有 `segments` 字段（例如 provider 忽略了
+/// verbose_json）时退回直接用 `text`，与旧行为一致。元数据字段缺失时按
+/// 「不丢弃」处理（unwrap_or 默认值），所以对不返回这些指标的 provider 是无害空转。
 fn extract_confident_text(json: &serde_json::Value) -> String {
     let Some(segments) = json.get("segments").and_then(|s| s.as_array()) else {
         return json["text"].as_str().unwrap_or("").trim().to_string();
@@ -219,12 +266,11 @@ fn extract_confident_text(json: &serde_json::Value) -> String {
             .and_then(|v| v.as_f64())
             .unwrap_or(1.0);
 
-        let is_hallucination = (no_speech > 0.6 && avg_logprob < -0.5)
-            || compression > 2.4
-            || avg_logprob < -1.0;
+        let is_hallucination =
+            (no_speech > 0.6 && avg_logprob < -0.5) || compression > 2.4 || avg_logprob < -1.0;
         if is_hallucination {
             log::warn!(
-                "[whisper] 幻聴セグメントを除外: no_speech={:.2} avg_logprob={:.2} compression={:.2} text={:?}",
+                "[whisper] 丢弃疑似幻听段落: no_speech={:.2} avg_logprob={:.2} compression={:.2} text={:?}",
                 no_speech,
                 avg_logprob,
                 compression,
@@ -237,105 +283,15 @@ fn extract_confident_text(json: &serde_json::Value) -> String {
 
     let kept = kept.trim().to_string();
     if kept.is_empty() {
-        // 全セグメントが除外された（＝ほぼ無音録音）。フォールバックで
-        // 生 text を返すと幻聴を拾い直すので、空のまま返す。上位は空転写を
-        // 「何も話していない」として無害に扱う。
+        // 全部段落被判为幻听（≈整段几乎是静音）。回退到原始 text 会把幻听又捡
+        // 回来，所以返回空串；上层把空转写当「什么都没说」无害处理。
         return String::new();
     }
     kept
 }
 
-/// 2 つの文字列の最長共通部分文字列を返す `(a 内開始位置, 長さ)`。
-/// 長さ 0 のときは `(0, 0)`。
-fn longest_common_substring(a: &[char], b: &[char]) -> (usize, usize) {
-    if a.is_empty() || b.is_empty() {
-        return (0, 0);
-    }
-    let mut prev = vec![0usize; b.len() + 1];
-    let mut best_len = 0usize;
-    let mut best_end_in_a = 0usize;
-    for i in 1..=a.len() {
-        let mut curr = vec![0usize; b.len() + 1];
-        for j in 1..=b.len() {
-            if a[i - 1] == b[j - 1] {
-                curr[j] = prev[j - 1] + 1;
-                if curr[j] > best_len {
-                    best_len = curr[j];
-                    best_end_in_a = i;
-                }
-            }
-        }
-        prev = curr;
-    }
-    (best_end_in_a - best_len, best_len)
-}
-
-/// Whisper が `prompt`（辞書語の `", "` 連結）を出力に echo（漏出）させた
-/// 断片を取り除く。
-///
-/// Whisper には prompt の内容を書き起こしに紛れ込ませる既知の欠陥があり、
-/// ユーザーが言っていない辞書語が「片沼ほとり, ADOS,」のようにカンマ込みで
-/// 出力されることがある。prompt は既知文字列なので、出力と prompt の最長共通
-/// 部分文字列を取り、それが **カンマ様の区切りを含む**（＝辞書語の羅列）なら
-/// echo とみなして除去する。カンマを含まない＝単独語の一致は、ユーザーが実際に
-/// その語を言った正当なケースと区別できないため除去しない。
-fn strip_prompt_echo(text: &str, prompt: Option<&str>) -> String {
-    let Some(prompt) = prompt else {
-        return text.to_string();
-    };
-    let prompt = prompt.trim();
-    if prompt.is_empty() {
-        return text.to_string();
-    }
-    let prompt_chars: Vec<char> = prompt.chars().collect();
-    let mut text_chars: Vec<char> = text.chars().collect();
-
-    const MIN_ECHO_LEN: usize = 5;
-    let is_comma = |c: char| matches!(c, ',' | '，' | '、');
-    let is_sep = |c: char| c.is_whitespace() || is_comma(c);
-
-    // 複数の echo 断片がありうるので、見つからなくなるまで繰り返す。
-    loop {
-        let (start, len) = longest_common_substring(&text_chars, &prompt_chars);
-        if len < MIN_ECHO_LEN {
-            break;
-        }
-        let frag = &text_chars[start..start + len];
-        if !frag.iter().copied().any(is_comma) {
-            // カンマを含まない一致は単独語。正当な発話の可能性があり除去しない。
-            break;
-        }
-        log::warn!(
-            "[whisper] prompt echo を除去: {:?}",
-            frag.iter().collect::<String>()
-        );
-        text_chars.drain(start..start + len);
-
-        // 除去で区切りが二重化したときだけ畳む：除去点の前後がどちらも
-        // 区切り（カンマ/空白）なら、後ろ側の区切り連続を削って 1 つにする。
-        // 片側だけが区切りの場合はユーザーが実際に打った句読点なので残す。
-        let head_sep = start > 0 && is_sep(text_chars[start - 1]);
-        let tail_sep = start < text_chars.len() && is_sep(text_chars[start]);
-        if head_sep && tail_sep {
-            while start < text_chars.len() && is_sep(text_chars[start]) {
-                text_chars.remove(start);
-            }
-        }
-    }
-
-    // 先頭・末尾に残った区切りを除去（echo が文頭/文末にあった場合）。
-    let mut result: Vec<char> = text_chars;
-    while result.first().is_some_and(|&c| is_sep(c)) {
-        result.remove(0);
-    }
-    while result.last().is_some_and(|&c| is_sep(c)) {
-        result.pop();
-    }
-    result.iter().collect()
-}
-
 fn pcm_duration_ms(pcm: &[u8]) -> u64 {
-    (pcm.len() as u64 / PCM_BYTES_PER_SAMPLE as u64) * 1000 / PCM_SAMPLE_RATE_HZ
+    super::pcm::pcm_duration_ms(pcm)
 }
 
 fn split_pcm_by_duration(pcm: &[u8], max_chunk_duration_ms: Option<u64>) -> Vec<&[u8]> {
@@ -639,60 +595,6 @@ mod tests {
     }
 
     #[test]
-    fn strip_prompt_echo_removes_comma_joined_dictionary_run() {
-        let prompt = "梁山泊, 片沼ほとり, ADOS, TRC.";
-        // 文中に prompt の断片が echo された
-        let text = "逆に言うと、片沼ほとり, ADOS, をこっちに移す";
-        let out = strip_prompt_echo(text, Some(prompt));
-        assert!(!out.contains("ADOS"), "echo が残っている: {out}");
-        assert!(out.contains("逆に言うと"));
-        assert!(out.contains("こっちに移す"));
-    }
-
-    #[test]
-    fn strip_prompt_echo_at_start_trims_leading_separators() {
-        let prompt = "梁山泊, 片沼ほとり, TRC.";
-        let text = "梁山泊, 片沼ほとり, 実際に話した内容";
-        let out = strip_prompt_echo(text, Some(prompt));
-        assert_eq!(out, "実際に話した内容");
-    }
-
-    #[test]
-    fn strip_prompt_echo_keeps_legit_single_word() {
-        // カンマを含まない単独一致は、ユーザーが実際にその語を言った可能性が
-        // あるので除去しない。
-        let prompt = "梁山泊, 片沼ほとり, TRC.";
-        let text = "梁山泊について話します";
-        assert_eq!(
-            strip_prompt_echo(text, Some(prompt)),
-            "梁山泊について話します"
-        );
-    }
-
-    #[test]
-    fn strip_prompt_echo_no_prompt_is_noop() {
-        assert_eq!(strip_prompt_echo("普通の文章です", None), "普通の文章です");
-    }
-
-    #[test]
-    fn extract_confident_text_drops_hallucinated_segment() {
-        let json = serde_json::json!({
-            "text": "本当の発話 幻聴",
-            "segments": [
-                {"text": "本当の発話", "no_speech_prob": 0.01, "avg_logprob": -0.2, "compression_ratio": 1.2},
-                {"text": "幻聴", "no_speech_prob": 0.9, "avg_logprob": -0.8, "compression_ratio": 1.1},
-            ]
-        });
-        assert_eq!(extract_confident_text(&json), "本当の発話");
-    }
-
-    #[test]
-    fn extract_confident_text_falls_back_to_text_without_segments() {
-        let json = serde_json::json!({ "text": "  素の文字起こし  " });
-        assert_eq!(extract_confident_text(&json), "素の文字起こし");
-    }
-
-    #[test]
     fn split_pcm_by_duration_keeps_default_as_single_chunk() {
         let pcm = vec![0u8; 96_000];
         assert_eq!(split_pcm_by_duration(&pcm, None), vec![pcm.as_slice()]);
@@ -792,6 +694,46 @@ mod tests {
         assert_eq!(join_transcript_chunks(&chunks), "「中文」");
     }
 
+    #[test]
+    fn extract_confident_text_drops_hallucinated_segment() {
+        let json = serde_json::json!({
+            "text": "本当の発話 幻聴",
+            "segments": [
+                {"text": "本当の発話", "no_speech_prob": 0.01, "avg_logprob": -0.2, "compression_ratio": 1.2},
+                {"text": "幻聴", "no_speech_prob": 0.9, "avg_logprob": -0.8, "compression_ratio": 1.1},
+            ]
+        });
+        assert_eq!(extract_confident_text(&json), "本当の発話");
+    }
+
+    #[test]
+    fn extract_confident_text_keeps_all_confident_segments() {
+        let json = serde_json::json!({
+            "text": "ignored",
+            "segments": [
+                {"text": "前半", "no_speech_prob": 0.0, "avg_logprob": -0.1, "compression_ratio": 1.0},
+                {"text": "後半", "no_speech_prob": 0.0, "avg_logprob": -0.2, "compression_ratio": 1.0},
+            ]
+        });
+        assert_eq!(extract_confident_text(&json), "前半後半");
+    }
+
+    #[test]
+    fn extract_confident_text_falls_back_to_text_without_segments() {
+        let json = serde_json::json!({ "text": "  素の文字起こし  " });
+        assert_eq!(extract_confident_text(&json), "素の文字起こし");
+    }
+
+    #[test]
+    fn extract_confident_text_missing_metrics_keeps_segment() {
+        // provider が指標を返さない場合は「不丢弃」＝そのまま残す（無害空転）。
+        let json = serde_json::json!({
+            "text": "x",
+            "segments": [ {"text": "保留される"} ]
+        });
+        assert_eq!(extract_confident_text(&json), "保留される");
+    }
+
     #[tokio::test]
     async fn transcribe_posts_single_request_without_chunk_limit() {
         let (base_url, server) = start_whisper_test_server(vec!["one"]);
@@ -831,6 +773,63 @@ mod tests {
 
         assert_eq!(transcript.text, "你好 world 尾");
         assert_eq!(transcript.duration_ms, 65_000);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn openrouter_format_posts_json_with_base64_audio() {
+        // issue #582：OpenRouterJson 走 application/json + input_audio.data(base64)，
+        // 而非 multipart；响应仍按 {text} 解析。
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "timed out waiting for ASR test request"
+                        );
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => panic!("accept ASR test request failed: {err}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let request = read_http_request(&mut stream);
+            let request_text = String::from_utf8_lossy(&request);
+            let lower = request_text.to_ascii_lowercase();
+            assert!(request_text.starts_with("POST /audio/transcriptions HTTP/1.1"));
+            assert!(lower.contains("content-type: application/json"));
+            assert!(lower.contains("authorization: bearer key"));
+            // body 是 JSON：含 input_audio.data + format:"wav"，且不是 multipart。
+            assert!(request_text.contains("input_audio"));
+            assert!(request_text.contains(r#""format":"wav""#));
+            assert!(!lower.contains("multipart/form-data"));
+            write_json_response(&mut stream, r#"{"text":"openrouter ok"}"#);
+        });
+        let base_url = format!("http://{}", addr);
+
+        let asr = WhisperBatchASR::new(
+            "key".to_string(),
+            base_url,
+            "openai/whisper-large-v3-turbo".to_string(),
+            None,
+            None,
+            false,
+        )
+        .with_request_format(AsrRequestFormat::OpenRouterJson);
+        let pcm = vec![0u8; 32_000 * 2];
+        asr.consume_pcm_chunk(&pcm);
+
+        let transcript = asr.transcribe().await.unwrap();
+        assert_eq!(transcript.text, "openrouter ok");
         server.join().unwrap();
     }
 

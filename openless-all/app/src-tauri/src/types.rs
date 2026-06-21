@@ -1,6 +1,23 @@
+#![cfg_attr(target_os = "linux", allow(dead_code, unused_variables))]
 //! Shared value types crossing the IPC boundary.
 
 use serde::{de, Deserialize, Deserializer, Serialize};
+
+#[path = "android/types.rs"]
+pub mod android_types;
+
+use android_types::{
+    default_android_insert_strategy, default_android_overlay_activation_mode,
+    default_android_overlay_cancel_swipe_direction, default_android_overlay_left_swipe_action,
+    default_android_overlay_size_dp, default_android_overlay_trigger,
+    normalize_android_insert_strategy, normalize_android_overlay_size_dp,
+};
+pub use android_types::{
+    AndroidAccessibilityState, AndroidAccessibilityStatus, AndroidInsertStrategy,
+    AndroidOverlayActivationMode, AndroidOverlayCancelSwipeDirection,
+    AndroidOverlayLeftSwipeAction, AndroidOverlayPermissionState, AndroidOverlayStatus,
+    AndroidOverlayTrigger,
+};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -60,19 +77,25 @@ pub enum PasteShortcut {
     ShiftInsert,
 }
 
-/// Auto-update 渠道。决定 Settings → 关于 里展示哪一类版本信息。
-/// `Stable` 沿用 `tauri-plugin-updater` 的默认 endpoints（即 `tauri.conf.json`
-/// 里的 `latest-{{target}}-{{arch}}.json`），与发版 pipeline 对齐。
-/// `Beta` 不动 plugin endpoints —— 只解锁 Settings 里"手动下载最新 Beta"的入口
-/// （fetch GitHub `prerelease` + 跳浏览器），物理隔离 Beta 包不会通过 auto-update
-/// 推到正式版用户。详见 README 的"Contributing workflow"和 CLAUDE.md 的
-/// `Branch & release-channel workflow` 段落。
+/// Auto-update 渠道。决定后台 AutoUpdateGate 拉哪条 manifest。
+/// `Stable` = `latest-android-{arch}.json`（或桌面 plugin-updater 正式版 endpoints）。
+/// `Beta` = `latest-android-{arch}-beta.json`（或桌面 beta endpoints）。
+/// Settings 里手动「检查正式版 / 检查 Beta」按钮显式传 channel，不受此 pref 影响。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateChannel {
     #[default]
     Stable,
     Beta,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +116,19 @@ pub struct DictationSession {
     pub final_text: String,
     #[serde(default, deserialize_with = "deserialize_dictation_session_mode")]
     pub mode: PolishMode,
+    /// 本次 dictation 使用的风格包。旧历史没有此字段时为 None；对话感知 polish
+    /// 只复用同一风格包的历史，避免切换风格包后旧上下文污染新提示词。
+    #[serde(default)]
+    pub style_pack_id: Option<String>,
+    /// 本次是否走翻译路径。决定对话感知上下文怎么复用这条历史：下一轮也是翻译时喂
+    /// `final_text`（译文）保持一致；下一轮是普通润色时改喂 `polish_source`（润色后的源文）
+    /// 以剔除译文、避免外语污染。
+    #[serde(default)]
+    pub translation_active: bool,
+    /// 翻译会话润色后的**源语言**文本（译文前的润色中间产物）。普通会话、解析失败或旧
+    /// 历史为 None。仅用于对话感知上下文：普通润色轮复用翻译历史时喂这一段而非译文。
+    #[serde(default)]
+    pub polish_source: Option<String>,
     pub app_bundle_id: Option<String>,
     pub app_name: Option<String>,
     pub insert_status: InsertStatus,
@@ -234,10 +270,6 @@ impl StyleSystemPrompts {
             PolishMode::Structured => &self.structured,
             PolishMode::Formal => &self.formal,
         }
-    }
-
-    pub fn is_default_for_mode(&self, mode: PolishMode) -> bool {
-        self.for_mode(mode) == StyleSystemPrompts::default().for_mode(mode)
     }
 
     pub fn with_legacy_custom_prompts(mut self, legacy: &CustomStylePrompts) -> Self {
@@ -638,10 +670,50 @@ pub struct UserPreferences {
     pub custom_combo_hotkey: Option<ComboBinding>,
     #[serde(default = "default_translation_hotkey")]
     pub translation_hotkey: ShortcutBinding,
+    /// 「切换风格」全局快捷键。`None` = 停用（不注册全局键）；`Some(...)` = 注册。
+    /// 默认 `Some(默认键)`，对老用户零行为变化，仅新增可清空（issue #576）。
     #[serde(default = "default_switch_style_hotkey")]
-    pub switch_style_hotkey: ShortcutBinding,
+    pub switch_style_hotkey: Option<ShortcutBinding>,
+    /// 「唤起 App」全局快捷键。`None` = 停用；`Some(...)` = 注册。默认 `Some(默认键)`。
     #[serde(default = "default_open_app_hotkey")]
-    pub open_app_hotkey: ShortcutBinding,
+    pub open_app_hotkey: Option<ShortcutBinding>,
+    /// Less Computer：是否启用。默认关闭，需用户在高级设置开启。
+    #[serde(default)]
+    pub coding_agent_enabled: bool,
+    /// Agent 后端：`claude-code-cli`（默认）或 `opencode-cli`。
+    #[serde(default = "default_coding_agent_provider")]
+    pub coding_agent_provider: String,
+    /// Agent 模型（`None` = 运行时取便宜默认 sonnet）。
+    #[serde(default)]
+    pub coding_agent_model: Option<String>,
+    /// 权限模式：plan/default/acceptEdits/bypassPermissions。默认 acceptEdits（放行+护栏）。
+    #[serde(default = "default_coding_agent_permission_mode")]
+    pub coding_agent_permission_mode: String,
+    /// Agent 工作目录（`None` = 临时目录）。
+    #[serde(default)]
+    pub coding_agent_workdir: Option<String>,
+    /// Less Computer 语音触发键。macOS 生效；支持单修饰键（左/右 Control、左/右 Option、Fn）
+    /// 和普通组合键。`None` = 停用。
+    #[serde(default = "default_coding_agent_voice_hotkey")]
+    pub coding_agent_voice_hotkey: Option<ShortcutBinding>,
+    /// 热键 1：语音 Agent 面板键。默认 Cmd/Ctrl+Shift+Enter。`None` = 停用。
+    #[serde(default = "default_coding_agent_panel_hotkey")]
+    pub coding_agent_panel_hotkey: Option<ShortcutBinding>,
+    /// 热键 2：快取用键（选中→Claude→回插）。默认 `None`（用户自配）。
+    #[serde(default)]
+    pub coding_agent_quick_hotkey: Option<ShortcutBinding>,
+    /// 局域网远程输入服务开关。桌面端启动 HTTPS+WS 服务，手机浏览器推 PCM 到电脑。
+    #[serde(default)]
+    pub remote_input_enabled: bool,
+    /// 局域网远程输入服务端口。
+    #[serde(default = "default_remote_input_port")]
+    pub remote_input_port: u16,
+    /// 当前远程输入 PIN。真实运行时 PIN 另有进程内/磁盘路径维护，此字段保留 wire 兼容。
+    #[serde(default)]
+    pub remote_input_pin: String,
+    /// 远程输入默认按钮模式。
+    #[serde(default = "default_remote_input_mode")]
+    pub remote_input_default_mode: String,
     /// 本地 Qwen3-ASR 当前激活的模型 id（"qwen3-asr-0.6b" / "qwen3-asr-1.7b"）。
     /// 仅在 active_asr_provider == "local-qwen3" 时有意义。
     #[serde(default = "default_local_asr_model")]
@@ -654,6 +726,11 @@ pub struct UserPreferences {
     /// 默认 300（5 分钟）：兼顾连续听写不重加载、长时间不用释放 1.2GB+ RAM。
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     pub local_asr_keep_loaded_secs: u32,
+    /// 本地模型自定义父目录。空字符串 = 使用系统默认 app data 下的 `models/`。
+    /// 非空时，实际模型根目录为 `<local_asr_models_base_dir>/OpenLess/models/`，
+    /// 让用户选择一个普通磁盘目录即可隔离 OpenLess 模型文件。
+    #[serde(default)]
+    pub local_asr_models_base_dir: String,
     /// Windows Foundry Local Whisper 当前激活的模型 alias。
     #[serde(default = "default_foundry_local_asr_model")]
     pub foundry_local_asr_model: String,
@@ -676,8 +753,8 @@ pub struct UserPreferences {
     /// foundry/qwen3 一致。
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     pub sherpa_onnx_keep_loaded_secs: u32,
-    /// Auto-update 渠道偏好。stable = 跟正式版（默认）；beta = Settings 里多
-    /// 一个手动下载 Beta 的入口。不影响 plugin-updater 的自动检查路径。
+    /// Auto-update 渠道。stable = 后台自动更新查正式版 manifest；beta = 查 Beta manifest。
+    /// 手动检查按钮显式指定 channel，与此 pref 解耦。
     #[serde(default)]
     pub update_channel: UpdateChannel,
     /// 历史记录保留天数。0 = 不按时间清理（仅受 200 条上限）。默认 7 天。
@@ -694,6 +771,9 @@ pub struct UserPreferences {
     /// 用户改用托盘菜单访问主窗口。默认 false 跟历史行为一致。
     #[serde(default)]
     pub start_minimized: bool,
+    /// UI theme: follow OS, force light, or force dark. Frontend applies via data-ol-theme.
+    #[serde(default)]
+    pub theme_mode: ThemeMode,
     /// 流式输入：润色 SSE 一边到达一边逐字模拟键盘事件输出到当前焦点。开启后用户感知到
     /// 的处理时延显著降低（润色 LLM 第一个 token 即开始落字）。
     ///
@@ -723,8 +803,9 @@ pub struct UserPreferences {
     /// 默认 true（更接近用户习惯）。
     #[serde(default = "default_true")]
     pub streaming_insert_save_clipboard: bool,
-    /// 主窗口启动 + 后台每 60 分钟自动检查云端新版本。默认 true。
-    /// 用户在 Settings → 关于 里可关。关闭后仅手动「检查更新」按钮可用。
+    /// 主窗口启动 + 后台每 60 分钟自动检查更新。默认 true。
+    /// Android 开启后自动检查并下载，校验后打开系统安装器；桌面仅自动检查 + 用户确认安装。
+    /// 关闭后仅 Settings 手动「检查更新」按钮可用。
     #[serde(default = "default_true")]
     pub auto_update_check: bool,
     /// 历史记录上限（条数）。`None` = 使用代码内 200 条硬上限；
@@ -750,10 +831,36 @@ pub struct UserPreferences {
     /// 上传 / 点赞需要带这个 header；空时上传被后端 401。
     #[serde(default)]
     pub marketplace_dev_login: String,
+    /// Android: text insertion strategy for cross-app dictation results.
+    #[serde(default = "default_android_insert_strategy")]
+    pub android_insert_strategy: AndroidInsertStrategy,
+    /// Android: when to show the floating overlay control.
+    #[serde(default = "default_android_overlay_trigger")]
+    pub android_overlay_trigger: AndroidOverlayTrigger,
+    /// Android: how the floating overlay enters the armed interaction state.
+    #[serde(default = "default_android_overlay_activation_mode")]
+    pub android_overlay_activation_mode: AndroidOverlayActivationMode,
+    /// Android: action performed by left swiping while the overlay is armed.
+    #[serde(default = "default_android_overlay_left_swipe_action")]
+    pub android_overlay_left_swipe_action: AndroidOverlayLeftSwipeAction,
+    /// Android: vertical swipe direction that cancels recording.
+    #[serde(default = "default_android_overlay_cancel_swipe_direction")]
+    pub android_overlay_cancel_swipe_direction: AndroidOverlayCancelSwipeDirection,
+    /// Android: floating overlay control diameter in dp.
+    #[serde(default = "default_android_overlay_size_dp")]
+    pub android_overlay_size_dp: u32,
 }
 
 fn default_local_asr_model() -> String {
     "qwen3-asr-0.6b".into()
+}
+
+fn default_remote_input_port() -> u16 {
+    8443
+}
+
+fn default_remote_input_mode() -> String {
+    "toggle".into()
 }
 
 fn default_history_retention_days() -> u32 {
@@ -834,12 +941,38 @@ struct UserPreferencesWire {
     translation_hotkey: Option<ShortcutBinding>,
     switch_style_hotkey: Option<ShortcutBinding>,
     open_app_hotkey: Option<ShortcutBinding>,
+    #[serde(default)]
+    coding_agent_enabled: bool,
+    #[serde(default = "default_coding_agent_provider")]
+    coding_agent_provider: String,
+    #[serde(default)]
+    coding_agent_model: Option<String>,
+    #[serde(default = "default_coding_agent_permission_mode")]
+    coding_agent_permission_mode: String,
+    #[serde(default)]
+    coding_agent_workdir: Option<String>,
+    #[serde(default = "default_coding_agent_voice_hotkey")]
+    coding_agent_voice_hotkey: Option<ShortcutBinding>,
+    #[serde(default = "default_coding_agent_panel_hotkey")]
+    coding_agent_panel_hotkey: Option<ShortcutBinding>,
+    #[serde(default)]
+    coding_agent_quick_hotkey: Option<ShortcutBinding>,
+    #[serde(default)]
+    remote_input_enabled: bool,
+    #[serde(default = "default_remote_input_port")]
+    remote_input_port: u16,
+    #[serde(default)]
+    remote_input_pin: String,
+    #[serde(default = "default_remote_input_mode")]
+    remote_input_default_mode: String,
     #[serde(default = "default_local_asr_model")]
     local_asr_active_model: String,
     #[serde(default = "default_local_asr_mirror")]
     local_asr_mirror: String,
     #[serde(default = "default_local_asr_keep_loaded_secs")]
     local_asr_keep_loaded_secs: u32,
+    #[serde(default)]
+    local_asr_models_base_dir: String,
     #[serde(default = "default_foundry_local_asr_model")]
     foundry_local_asr_model: String,
     #[serde(default = "default_foundry_local_runtime_source")]
@@ -862,6 +995,8 @@ struct UserPreferencesWire {
     polish_context_window_minutes: u32,
     #[serde(default)]
     start_minimized: bool,
+    #[serde(default)]
+    theme_mode: ThemeMode,
     #[serde(default = "default_true")]
     streaming_insert: bool,
     #[serde(default)]
@@ -880,6 +1015,18 @@ struct UserPreferencesWire {
     marketplace_base_url: String,
     #[serde(default)]
     marketplace_dev_login: String,
+    #[serde(default = "default_android_insert_strategy")]
+    android_insert_strategy: AndroidInsertStrategy,
+    #[serde(default = "default_android_overlay_trigger")]
+    android_overlay_trigger: AndroidOverlayTrigger,
+    #[serde(default = "default_android_overlay_activation_mode")]
+    android_overlay_activation_mode: AndroidOverlayActivationMode,
+    #[serde(default = "default_android_overlay_left_swipe_action")]
+    android_overlay_left_swipe_action: AndroidOverlayLeftSwipeAction,
+    #[serde(default = "default_android_overlay_cancel_swipe_direction")]
+    android_overlay_cancel_swipe_direction: AndroidOverlayCancelSwipeDirection,
+    #[serde(default = "default_android_overlay_size_dp")]
+    android_overlay_size_dp: u32,
 }
 
 impl Default for UserPreferencesWire {
@@ -913,11 +1060,25 @@ impl Default for UserPreferencesWire {
             qa_save_history: prefs.qa_save_history,
             custom_combo_hotkey: prefs.custom_combo_hotkey,
             translation_hotkey: None,
-            switch_style_hotkey: None,
-            open_app_hotkey: None,
+            // 默认携带默认键（Some），保证缺字段时仍是启用状态；None 专表「用户主动停用」。
+            switch_style_hotkey: prefs.switch_style_hotkey,
+            open_app_hotkey: prefs.open_app_hotkey,
+            coding_agent_enabled: prefs.coding_agent_enabled,
+            coding_agent_provider: prefs.coding_agent_provider,
+            coding_agent_model: prefs.coding_agent_model,
+            coding_agent_permission_mode: prefs.coding_agent_permission_mode,
+            coding_agent_workdir: prefs.coding_agent_workdir,
+            coding_agent_voice_hotkey: prefs.coding_agent_voice_hotkey,
+            coding_agent_panel_hotkey: prefs.coding_agent_panel_hotkey,
+            coding_agent_quick_hotkey: prefs.coding_agent_quick_hotkey,
+            remote_input_enabled: prefs.remote_input_enabled,
+            remote_input_port: prefs.remote_input_port,
+            remote_input_pin: prefs.remote_input_pin,
+            remote_input_default_mode: prefs.remote_input_default_mode,
             local_asr_active_model: prefs.local_asr_active_model,
             local_asr_mirror: prefs.local_asr_mirror,
             local_asr_keep_loaded_secs: prefs.local_asr_keep_loaded_secs,
+            local_asr_models_base_dir: prefs.local_asr_models_base_dir,
             foundry_local_asr_model: prefs.foundry_local_asr_model,
             foundry_local_runtime_source: prefs.foundry_local_runtime_source,
             foundry_local_asr_language_hint: prefs.foundry_local_asr_language_hint,
@@ -929,6 +1090,7 @@ impl Default for UserPreferencesWire {
             history_retention_days: prefs.history_retention_days,
             polish_context_window_minutes: prefs.polish_context_window_minutes,
             start_minimized: prefs.start_minimized,
+            theme_mode: prefs.theme_mode,
             streaming_insert: prefs.streaming_insert,
             streaming_insert_default_migrated: prefs.streaming_insert_default_migrated,
             streaming_insert_save_clipboard: prefs.streaming_insert_save_clipboard,
@@ -938,6 +1100,12 @@ impl Default for UserPreferencesWire {
             audio_recording_max_entries: prefs.audio_recording_max_entries,
             marketplace_base_url: prefs.marketplace_base_url,
             marketplace_dev_login: prefs.marketplace_dev_login,
+            android_insert_strategy: prefs.android_insert_strategy,
+            android_overlay_trigger: prefs.android_overlay_trigger,
+            android_overlay_activation_mode: prefs.android_overlay_activation_mode,
+            android_overlay_left_swipe_action: prefs.android_overlay_left_swipe_action,
+            android_overlay_cancel_swipe_direction: prefs.android_overlay_cancel_swipe_direction,
+            android_overlay_size_dp: prefs.android_overlay_size_dp,
         }
     }
 }
@@ -991,17 +1159,31 @@ impl<'de> Deserialize<'de> for UserPreferences {
             output_language_preference: wire.output_language_preference,
             qa_hotkey: wire.qa_hotkey,
             qa_save_history: wire.qa_save_history,
+            coding_agent_enabled: wire.coding_agent_enabled,
+            coding_agent_provider: wire.coding_agent_provider,
+            coding_agent_model: wire.coding_agent_model,
+            coding_agent_permission_mode: wire.coding_agent_permission_mode,
+            coding_agent_workdir: wire.coding_agent_workdir,
+            coding_agent_voice_hotkey: wire.coding_agent_voice_hotkey,
+            coding_agent_panel_hotkey: wire.coding_agent_panel_hotkey,
+            coding_agent_quick_hotkey: wire.coding_agent_quick_hotkey,
+            remote_input_enabled: wire.remote_input_enabled,
+            remote_input_port: wire.remote_input_port,
+            remote_input_pin: wire.remote_input_pin,
+            remote_input_default_mode: wire.remote_input_default_mode,
             custom_combo_hotkey: wire.custom_combo_hotkey,
             translation_hotkey: wire
                 .translation_hotkey
                 .unwrap_or_else(default_translation_hotkey),
-            switch_style_hotkey: wire
-                .switch_style_hotkey
-                .unwrap_or_else(default_switch_style_hotkey),
-            open_app_hotkey: wire.open_app_hotkey.unwrap_or_else(default_open_app_hotkey),
+            // 直传 Option：None = 用户主动停用，不再用 unwrap_or_else 塌缩成默认键
+            // （那正是 #576「无法关闭」的根因）。缺字段时 wire 的 serde struct-default
+            // 会落到 Some(默认键)，保证老用户/新用户仍是启用。
+            switch_style_hotkey: wire.switch_style_hotkey,
+            open_app_hotkey: wire.open_app_hotkey,
             local_asr_active_model: wire.local_asr_active_model,
             local_asr_mirror: wire.local_asr_mirror,
             local_asr_keep_loaded_secs: wire.local_asr_keep_loaded_secs,
+            local_asr_models_base_dir: wire.local_asr_models_base_dir,
             foundry_local_asr_model: wire.foundry_local_asr_model,
             foundry_local_runtime_source:
                 crate::asr::local::foundry_native::normalize_runtime_source_str(
@@ -1016,6 +1198,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
             history_retention_days: wire.history_retention_days,
             polish_context_window_minutes: wire.polish_context_window_minutes,
             start_minimized: wire.start_minimized,
+            theme_mode: wire.theme_mode,
             streaming_insert,
             streaming_insert_default_migrated: true,
             streaming_insert_save_clipboard: wire.streaming_insert_save_clipboard,
@@ -1025,12 +1208,44 @@ impl<'de> Deserialize<'de> for UserPreferences {
             audio_recording_max_entries: wire.audio_recording_max_entries,
             marketplace_base_url: wire.marketplace_base_url,
             marketplace_dev_login: wire.marketplace_dev_login,
+            android_insert_strategy: normalize_android_insert_strategy(
+                wire.android_insert_strategy,
+            ),
+            android_overlay_trigger: wire.android_overlay_trigger.normalized(),
+            android_overlay_activation_mode: wire.android_overlay_activation_mode,
+            android_overlay_left_swipe_action: wire.android_overlay_left_swipe_action,
+            android_overlay_cancel_swipe_direction: wire.android_overlay_cancel_swipe_direction,
+            android_overlay_size_dp: normalize_android_overlay_size_dp(
+                wire.android_overlay_size_dp,
+            ),
         })
     }
 }
 
 fn default_qa_hotkey() -> Option<ShortcutBinding> {
     Some(ShortcutBinding::default_qa())
+}
+
+fn default_coding_agent_provider() -> String {
+    "claude-code-cli".to_string()
+}
+
+fn default_coding_agent_permission_mode() -> String {
+    "acceptEdits".to_string()
+}
+
+pub(crate) fn default_coding_agent_voice_hotkey() -> Option<ShortcutBinding> {
+    Some(ShortcutBinding {
+        primary: "LeftControl".into(),
+        modifiers: Vec::new(),
+    })
+}
+
+pub(crate) fn default_coding_agent_panel_hotkey() -> Option<ShortcutBinding> {
+    Some(ShortcutBinding {
+        primary: "Enter".into(),
+        modifiers: vec!["cmd".into(), "shift".into()],
+    })
 }
 
 fn default_translation_hotkey() -> ShortcutBinding {
@@ -1040,18 +1255,18 @@ fn default_translation_hotkey() -> ShortcutBinding {
     }
 }
 
-fn default_switch_style_hotkey() -> ShortcutBinding {
-    ShortcutBinding {
+fn default_switch_style_hotkey() -> Option<ShortcutBinding> {
+    Some(ShortcutBinding {
         primary: "S".into(),
         modifiers: default_app_shortcut_modifiers(),
-    }
+    })
 }
 
-fn default_open_app_hotkey() -> ShortcutBinding {
-    ShortcutBinding {
+fn default_open_app_hotkey() -> Option<ShortcutBinding> {
+    Some(ShortcutBinding {
         primary: "O".into(),
         modifiers: default_app_shortcut_modifiers(),
-    }
+    })
 }
 
 fn default_app_shortcut_modifiers() -> Vec<String> {
@@ -1692,9 +1907,22 @@ impl Default for UserPreferences {
             translation_hotkey: default_translation_hotkey(),
             switch_style_hotkey: default_switch_style_hotkey(),
             open_app_hotkey: default_open_app_hotkey(),
+            coding_agent_enabled: false,
+            coding_agent_provider: default_coding_agent_provider(),
+            coding_agent_model: None,
+            coding_agent_permission_mode: default_coding_agent_permission_mode(),
+            coding_agent_workdir: None,
+            coding_agent_voice_hotkey: default_coding_agent_voice_hotkey(),
+            coding_agent_panel_hotkey: default_coding_agent_panel_hotkey(),
+            coding_agent_quick_hotkey: None,
+            remote_input_enabled: false,
+            remote_input_port: default_remote_input_port(),
+            remote_input_pin: String::new(),
+            remote_input_default_mode: default_remote_input_mode(),
             local_asr_active_model: default_local_asr_model(),
             local_asr_mirror: default_local_asr_mirror(),
             local_asr_keep_loaded_secs: default_local_asr_keep_loaded_secs(),
+            local_asr_models_base_dir: String::new(),
             foundry_local_asr_model: default_foundry_local_asr_model(),
             foundry_local_runtime_source: default_foundry_local_runtime_source(),
             foundry_local_asr_language_hint: String::new(),
@@ -1706,6 +1934,7 @@ impl Default for UserPreferences {
             history_retention_days: default_history_retention_days(),
             polish_context_window_minutes: default_polish_context_window_minutes(),
             start_minimized: false,
+            theme_mode: ThemeMode::default(),
             streaming_insert: true,
             streaming_insert_default_migrated: true,
             streaming_insert_save_clipboard: true,
@@ -1715,6 +1944,13 @@ impl Default for UserPreferences {
             audio_recording_max_entries: None,
             marketplace_base_url: String::new(),
             marketplace_dev_login: String::new(),
+            android_insert_strategy: default_android_insert_strategy(),
+            android_overlay_trigger: default_android_overlay_trigger(),
+            android_overlay_activation_mode: default_android_overlay_activation_mode(),
+            android_overlay_left_swipe_action: default_android_overlay_left_swipe_action(),
+            android_overlay_cancel_swipe_direction: default_android_overlay_cancel_swipe_direction(
+            ),
+            android_overlay_size_dp: default_android_overlay_size_dp(),
         }
     }
 }
@@ -1889,6 +2125,7 @@ pub enum HotkeyTrigger {
     RightCommand,
     Fn,
     RightAlt, // Windows synonym for RightOption
+    MediaPlayPause,
     Custom,
 }
 
@@ -1902,6 +2139,7 @@ impl HotkeyTrigger {
             HotkeyTrigger::RightCommand => "右 Command",
             HotkeyTrigger::Fn => "Fn (地球键)",
             HotkeyTrigger::RightAlt => "右 Alt",
+            HotkeyTrigger::MediaPlayPause => "⏯ Media 播放/暂停",
             HotkeyTrigger::Custom => "自定义组合键",
         }
     }
@@ -1921,6 +2159,8 @@ pub enum HotkeyAdapterKind {
     MacEventTap,
     WindowsLowLevel,
     Fcitx5,
+    /// Mobile platforms do not expose desktop global hotkey adapters.
+    Unavailable,
 }
 
 impl HotkeyAdapterKind {
@@ -1929,6 +2169,7 @@ impl HotkeyAdapterKind {
             HotkeyAdapterKind::MacEventTap => "macOS Event Tap",
             HotkeyAdapterKind::WindowsLowLevel => "Windows 低层键盘 hook",
             HotkeyAdapterKind::Fcitx5 => "fcitx5 输入法插件",
+            HotkeyAdapterKind::Unavailable => "不可用",
         }
     }
 }
@@ -1993,6 +2234,7 @@ fn legacy_trigger_code(trigger: HotkeyTrigger) -> &'static str {
         HotkeyTrigger::Fn => "ControlRight",
         #[cfg(not(target_os = "windows"))]
         HotkeyTrigger::Fn => "Fn",
+        HotkeyTrigger::MediaPlayPause => "MediaPlayPause",
         HotkeyTrigger::Custom => "",
     }
 }
@@ -2083,6 +2325,21 @@ pub struct HotkeyCapability {
 
 impl HotkeyCapability {
     pub fn current() -> Self {
+        #[cfg(mobile)]
+        {
+            return Self {
+                adapter: HotkeyAdapterKind::Unavailable,
+                available_triggers: Vec::new(),
+                requires_accessibility_permission: false,
+                supports_modifier_only_trigger: false,
+                supports_side_specific_modifiers: false,
+                explicit_fallback_available: false,
+                status_hint: Some(
+                    "移动端不支持全局热键；请使用应用内录音按钮或悬浮窗（需授权）。".into(),
+                ),
+            };
+        }
+
         #[cfg(target_os = "macos")]
         {
             Self {
@@ -2113,6 +2370,7 @@ impl HotkeyCapability {
                     HotkeyTrigger::RightAlt,
                     HotkeyTrigger::LeftControl,
                     HotkeyTrigger::RightCommand,
+                    HotkeyTrigger::MediaPlayPause,
                     HotkeyTrigger::Custom,
                 ],
                 requires_accessibility_permission: false,
@@ -2126,7 +2384,7 @@ impl HotkeyCapability {
             };
         }
 
-        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows"), not(mobile)))]
         {
             Self {
                 adapter: HotkeyAdapterKind::Fcitx5,
@@ -2186,6 +2444,68 @@ pub struct WindowsImeStatus {
     pub using_tsf_backend: bool,
     pub message: String,
     pub dll_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformCapabilities {
+    pub platform: String,
+    pub supports_ime_input: bool,
+    pub supports_overlay: bool,
+    pub supports_desktop_hotkey: bool,
+    pub supports_tray: bool,
+    pub supports_local_asr: bool,
+    pub supports_in_app_dictation: bool,
+    pub supports_auto_update: bool,
+}
+
+impl PlatformCapabilities {
+    pub fn current() -> Self {
+        #[cfg(target_os = "android")]
+        {
+            Self {
+                platform: "android".to_string(),
+                supports_ime_input: false,
+                supports_overlay: true,
+                supports_desktop_hotkey: false,
+                supports_tray: false,
+                supports_local_asr: false,
+                supports_in_app_dictation: true,
+                supports_auto_update: true,
+            }
+        }
+
+        #[cfg(all(
+            any(target_os = "android", target_os = "ios"),
+            not(target_os = "android")
+        ))]
+        {
+            Self {
+                platform: "mobile".to_string(),
+                supports_ime_input: false,
+                supports_overlay: false,
+                supports_desktop_hotkey: false,
+                supports_tray: false,
+                supports_local_asr: false,
+                supports_in_app_dictation: false,
+                supports_auto_update: false,
+            }
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            Self {
+                platform: "desktop".to_string(),
+                supports_ime_input: cfg!(target_os = "windows"),
+                supports_overlay: true,
+                supports_desktop_hotkey: true,
+                supports_tray: true,
+                supports_local_asr: cfg!(any(target_os = "macos", target_os = "windows")),
+                supports_in_app_dictation: false,
+                supports_auto_update: true,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2262,6 +2582,10 @@ pub struct CapsulePayload {
     /// 当前 session 是否处于翻译模式（用户按过 Shift）。前端用它在胶囊顶部
     /// 渲染"正在翻译"标签，让用户立刻知道这次输出会走翻译管线。详见 issue #4。
     pub translation: bool,
+    /// 当前是否是 Less Computer（语音 Agent 操控电脑）会话。前端据此把处理态文案
+    /// 从 "thinking" 换成 "using"——告诉用户 Agent 正在操作电脑而非单纯思考。
+    #[serde(default)]
+    pub operating: bool,
 }
 
 /// Snapshot of credentials read from vault — only what the UI needs to know
@@ -2350,6 +2674,56 @@ mod tests {
 
         let restored: UserPreferences = serde_json::from_str(&json).unwrap();
         assert!(!restored.audio_cue_on_record);
+    }
+
+    #[test]
+    fn action_hotkeys_default_to_enabled() {
+        // issue #576：默认仍开启（Some 默认键），对老用户零行为变化。
+        let prefs = UserPreferences::default();
+        assert!(prefs.switch_style_hotkey.is_some());
+        assert!(prefs.open_app_hotkey.is_some());
+    }
+
+    #[test]
+    fn missing_action_hotkeys_default_to_enabled() {
+        // 老用户/缺字段：wire 的 struct-default 落到 Some(默认键)，不应被当成停用。
+        let prefs: UserPreferences = serde_json::from_str("{}").unwrap();
+        assert!(prefs.switch_style_hotkey.is_some());
+        assert!(prefs.open_app_hotkey.is_some());
+    }
+
+    #[test]
+    fn disabled_action_hotkeys_round_trip_as_null() {
+        // issue #576：用户清空（None=停用）后存盘→读回必须仍是 None，
+        // 不能像旧逻辑那样被 unwrap_or_else 塌缩回默认键。
+        let disabled = UserPreferences {
+            switch_style_hotkey: None,
+            open_app_hotkey: None,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&disabled).unwrap();
+        assert!(
+            json.contains("\"switchStyleHotkey\":null"),
+            "停用应序列化成 null，实际: {json}"
+        );
+        let restored: UserPreferences = serde_json::from_str(&json).unwrap();
+        assert!(restored.switch_style_hotkey.is_none());
+        assert!(restored.open_app_hotkey.is_none());
+    }
+
+    #[test]
+    fn explicit_action_hotkey_binding_round_trips() {
+        // 旧 preferences.json 里带实际绑定 → 读回应保留为 Some（启用）。
+        let prefs: UserPreferences = serde_json::from_str(
+            r#"{"switchStyleHotkey":{"primary":"S","modifiers":["cmd","shift"]}}"#,
+        )
+        .unwrap();
+        let binding = prefs.switch_style_hotkey.expect("应保留为 Some");
+        assert_eq!(binding.primary, "S");
+        assert_eq!(
+            binding.modifiers,
+            vec!["cmd".to_string(), "shift".to_string()]
+        );
     }
 
     #[test]

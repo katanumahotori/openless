@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables)]
 //! sherpa-onnx 本地 ASR provider（Windows offline batch + online streaming）。
 //!
 //! 形状与 `foundry_provider.rs` 对齐：
@@ -221,11 +222,11 @@ impl crate::recorder::AudioConsumer for SherpaOnnxAsr {
 }
 
 fn pcm_duration_ms(pcm: &[u8]) -> u64 {
-    pcm_duration_ms_from_bytes(pcm.len() as u64)
+    crate::asr::pcm::pcm_duration_ms(pcm)
 }
 
 fn pcm_duration_ms_from_bytes(bytes: u64) -> u64 {
-    (bytes / 2) * 1000 / 16_000
+    crate::asr::pcm::pcm_duration_ms_from_bytes(bytes)
 }
 
 fn trim_transcript_text(text: &str) -> String {

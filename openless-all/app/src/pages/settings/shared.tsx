@@ -2,6 +2,7 @@
 // AsrPresetId 也放在这里，让 settings/ 下各 section 都从同一处来源拿。
 
 import type { CSSProperties, ReactNode } from "react"
+import { useMobileLayout } from "../../lib/useMobileLayout"
 
 export function SectionTitle({
     children,
@@ -26,26 +27,12 @@ export function SectionTitle({
     )
 }
 
-export function SectionDesc({
-    children,
-    style,
-}: {
+// 页面瘦身：设置页描述文案全部隐藏（保留组件签名 + 调用点，便于需要时恢复）。
+export function SectionDesc(_props: {
     children: ReactNode
     style?: CSSProperties
 }) {
-    return (
-        <div
-            style={{
-                fontSize: 12.5,
-                color: "var(--ol-ink-3)",
-                lineHeight: 1.6,
-                marginBottom: 16,
-                ...style,
-            }}
-        >
-            {children}
-        </div>
-    )
+    return null
 }
 
 interface SettingRowProps {
@@ -55,29 +42,25 @@ interface SettingRowProps {
     controlWidth?: number | string
 }
 
+// 页面瘦身：不再渲染每行的描述小字（desc 仍保留在 props 里，调用点无需改、便于恢复）。
 export function SettingRow({
     label,
-    desc,
     children,
     controlWidth,
 }: SettingRowProps) {
+    const mobile = useMobileLayout()
     return (
         <div
             style={{
                 display: "grid",
-                gridTemplateColumns: "minmax(0, 180px) minmax(0, 1fr)",
-                gap: 16,
-                padding: "14px 0",
+                gridTemplateColumns: mobile ? "minmax(0, 1fr)" : "minmax(0, 180px) minmax(0, 1fr)",
+                gap: mobile ? 8 : 16,
+                padding: mobile ? "12px 0" : "14px 0",
                 borderTop: "0.5px solid var(--ol-line-soft)",
-                alignItems: desc ? "flex-start" : "center",
+                alignItems: "center",
             }}
         >
-            <div
-                style={{
-                    minWidth: 0,
-                    alignSelf: desc ? "flex-start" : "center",
-                }}
-            >
+            <div style={{ minWidth: 0, alignSelf: "center" }}>
                 <div
                     style={{
                         fontSize: 13,
@@ -87,25 +70,16 @@ export function SettingRow({
                 >
                     {label}
                 </div>
-                {desc && (
-                    <div
-                        style={{
-                            fontSize: 11.5,
-                            color: "var(--ol-ink-4)",
-                            marginTop: 4,
-                            lineHeight: 1.5,
-                        }}
-                    >
-                        {desc}
-                    </div>
-                )}
             </div>
             <div
                 style={{
                     display: "flex",
                     alignItems: "center",
                     minWidth: 0,
-                    width: controlWidth ?? "auto",
+                    width: mobile ? "100%" : controlWidth ?? "auto",
+                    maxWidth: "100%",
+                    flexWrap: mobile ? "wrap" : "nowrap",
+                    gap: mobile ? 6 : undefined,
                 }}
             >
                 {children}
@@ -154,6 +128,37 @@ export function Toggle({
     )
 }
 
+export function chipSelectedStyle(selected: boolean): CSSProperties {
+    return {
+        background: selected ? "var(--ol-pill-selected-bg)" : "transparent",
+        border: selected
+            ? "0.5px solid var(--ol-pill-selected-border)"
+            : "0.5px solid var(--ol-line-strong)",
+        color: selected ? "var(--ol-pill-selected-ink)" : "var(--ol-ink-3)",
+    }
+}
+
+export const btnGhostStyle: CSSProperties = {
+    padding: "5px 10px",
+    fontSize: 12,
+    borderRadius: 6,
+    border: "0.5px solid var(--ol-line-strong)",
+    background: "var(--ol-control-solid)",
+    color: "var(--ol-ink-2)",
+    cursor: "default",
+    fontFamily: "inherit",
+    maxWidth: "100%",
+    transition:
+        "background 0.16s var(--ol-motion-quick), border-color 0.16s var(--ol-motion-quick)",
+}
+
+export const segmentedTrackStyle: CSSProperties = {
+    display: "inline-flex",
+    padding: 2,
+    borderRadius: 8,
+    background: "var(--ol-segmented-bg)",
+}
+
 export const inputStyle: CSSProperties = {
     flex: 1,
     height: 32,
@@ -179,6 +184,9 @@ export type AsrPresetId =
     | "zhipu"
     | "groq"
     | "whisper"
+    | "openrouter"
+    | "xiaomi-mimo-asr"
     | "foundry-local-whisper"
     | "sherpa-onnx-local"
     | "local-qwen3"
+    | "apple-speech"

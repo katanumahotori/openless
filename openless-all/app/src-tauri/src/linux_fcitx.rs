@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "linux", allow(dead_code, unused_variables))]
 //! Linux fcitx5 插件 DBus 客户端。
 //!
 //! 封装对 `org.fcitx.Fcitx.OpenLess1` 接口的调用，
@@ -19,8 +20,8 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// 返回 `Ok(())` 表示文字已提交，`Err` 表示调用失败（插件未加载 / DBus 不通等）。
 pub fn commit_text(text: &str) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "CommitText")
         .map_err(|e| format!("build msg: {e}"))?
         .append1(text);
@@ -33,8 +34,8 @@ pub fn commit_text(text: &str) -> Result<(), String> {
 ///
 /// `keys` 为 Key::parse 格式的字符串数组，例如 `["Control+space"]`。
 pub fn set_hotkey(keys: &[&str]) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let list: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetHotkey")
         .map_err(|e| format!("build msg: {e}"))?
@@ -46,8 +47,8 @@ pub fn set_hotkey(keys: &[&str]) -> Result<(), String> {
 
 /// 通过 fcitx5 插件直接设置 sym + states 作为触发键。
 pub fn set_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetHotkeyRaw")
         .map_err(|e| format!("build msg: {e}"))?
         .append2(sym, states);
@@ -58,8 +59,8 @@ pub fn set_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
 
 /// 通过 fcitx5 插件设置 QA 面板快捷键 sym + states。
 pub fn set_qa_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetQaHotkeyRaw")
         .map_err(|e| format!("build msg: {e}"))?
         .append2(sym, states);
@@ -70,8 +71,8 @@ pub fn set_qa_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
 
 /// 通过 fcitx5 插件设置翻译模式修饰键 sym + states。
 pub fn set_translation_hotkey_raw(sym: u32, states: u32) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetTranslationHotkeyRaw")
         .map_err(|e| format!("build msg: {e}"))?
         .append2(sym, states);
@@ -96,10 +97,13 @@ fn trigger_to_keysym(trigger: crate::types::HotkeyTrigger) -> u32 {
     match trigger {
         crate::types::HotkeyTrigger::RightControl => KEYSYM_CONTROL_R,
         crate::types::HotkeyTrigger::LeftControl => KEYSYM_CONTROL_L,
-        crate::types::HotkeyTrigger::RightOption | crate::types::HotkeyTrigger::RightAlt => KEYSYM_ALT_R,
+        crate::types::HotkeyTrigger::RightOption | crate::types::HotkeyTrigger::RightAlt => {
+            KEYSYM_ALT_R
+        }
         crate::types::HotkeyTrigger::LeftOption => KEYSYM_ALT_L,
         crate::types::HotkeyTrigger::RightCommand => KEYSYM_SUPER_R,
         crate::types::HotkeyTrigger::Fn => KEYSYM_CONTROL_R,
+        crate::types::HotkeyTrigger::MediaPlayPause => unreachable!("Windows-only"),
         crate::types::HotkeyTrigger::Custom => unreachable!(),
     }
 }
@@ -112,13 +116,16 @@ fn trigger_name(trigger: crate::types::HotkeyTrigger) -> &'static str {
         crate::types::HotkeyTrigger::LeftOption => "Alt_L",
         crate::types::HotkeyTrigger::RightCommand => "Super_R",
         crate::types::HotkeyTrigger::Fn => "Control_R",
+        crate::types::HotkeyTrigger::MediaPlayPause => unreachable!("Windows-only"),
         crate::types::HotkeyTrigger::Custom => unreachable!(),
     }
 }
 
 /// 将 OpenLess 的主听写热键绑定同步到 fcitx5 插件。
 pub fn sync_binding_to_plugin(binding: &crate::types::HotkeyBinding) {
-    if binding.trigger == crate::types::HotkeyTrigger::Custom {
+    if binding.trigger == crate::types::HotkeyTrigger::Custom
+        || binding.trigger == crate::types::HotkeyTrigger::MediaPlayPause
+    {
         return;
     }
     let sym = trigger_to_keysym(binding.trigger);
@@ -166,13 +173,11 @@ pub fn binding_to_fcitx_key_string(binding: &crate::types::ShortcutBinding) -> S
 
 /// 通过 fcitx5 插件的 SetCustomDictationTrigger 方法设置自定义组合键。
 pub fn set_custom_dictation_trigger(key_string: &str) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
-    let msg = dbus::Message::new_method_call(
-        DEST, PATH, IFACE, "SetCustomDictationTrigger",
-    )
-    .map_err(|e| format!("build msg: {e}"))?
-    .append1(key_string);
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
+    let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetCustomDictationTrigger")
+        .map_err(|e| format!("build msg: {e}"))?
+        .append1(key_string);
     conn.send_with_reply_and_block(msg, TIMEOUT)
         .map_err(|e| format!("SetCustomDictationTrigger: {e}"))?;
     Ok(())
@@ -185,10 +190,15 @@ pub fn sync_qa_binding(trigger: Option<crate::types::HotkeyTrigger>) {
         let _ = set_qa_hotkey_raw(0, 0);
         return;
     };
+    if trigger == crate::types::HotkeyTrigger::MediaPlayPause {
+        return;
+    }
     let sym = trigger_to_keysym(trigger);
     let name = trigger_name(trigger);
     match set_qa_hotkey_raw(sym, 0) {
-        Ok(()) => log::info!("[fcitx] Synced QA hotkey {name} (sym={sym}) to plugin via SetQaHotkeyRaw"),
+        Ok(()) => {
+            log::info!("[fcitx] Synced QA hotkey {name} (sym={sym}) to plugin via SetQaHotkeyRaw")
+        }
         Err(e) => log::warn!("[fcitx] Failed to sync QA hotkey to plugin: {e}"),
     }
 }
@@ -199,6 +209,9 @@ pub fn sync_translation_binding(trigger: Option<crate::types::HotkeyTrigger>) {
         let _ = set_translation_hotkey_raw(0, 0);
         return;
     };
+    if trigger == crate::types::HotkeyTrigger::MediaPlayPause {
+        return;
+    }
     let sym = trigger_to_keysym(trigger);
     let name = trigger_name(trigger);
     match set_translation_hotkey_raw(sym, 0) {
@@ -209,8 +222,8 @@ pub fn sync_translation_binding(trigger: Option<crate::types::HotkeyTrigger>) {
 
 /// 通过 fcitx5 插件在候选词列表下方显示状态文本（不干扰输入法预编辑）。
 pub fn set_aux_down(text: &str) -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "SetAuxDown")
         .map_err(|e| format!("build msg: {e}"))?
         .append1(text);
@@ -221,8 +234,8 @@ pub fn set_aux_down(text: &str) -> Result<(), String> {
 
 /// 清除 fcitx5 插件候选词列表下方状态文本。
 pub fn clear_aux_down() -> Result<(), String> {
-    let conn = dbus::blocking::Connection::new_session()
-        .map_err(|e| format!("dbus session: {e}"))?;
+    let conn =
+        dbus::blocking::Connection::new_session().map_err(|e| format!("dbus session: {e}"))?;
     let msg = dbus::Message::new_method_call(DEST, PATH, IFACE, "ClearAuxDown")
         .map_err(|e| format!("build msg: {e}"))?;
     conn.send_with_reply_and_block(msg, TIMEOUT)
@@ -411,32 +424,57 @@ pub fn start_dictation_signal_listener(
 /// 未安装时输出警告，不做任何文件 I/O。
 #[cfg(target_os = "linux")]
 pub fn ensure_plugin_installed(_app: &tauri::AppHandle) {
-    // fcitx5 在不同发行版的 lib 路径不同
+    // fcitx5 在不同发行版的 lib 路径不同，同时支持用户 XDG 安装
     let lib_dirs = [
         "/usr/lib/x86_64-linux-gnu/fcitx5", // Debian multiarch
-        "/usr/lib64/fcitx5",                 // RPM 64-bit
-        "/usr/lib/fcitx5",                   // 通用回退
+        "/usr/lib64/fcitx5",                // RPM 64-bit
+        "/usr/lib/fcitx5",                  // 通用回退
     ];
     let system_conf = std::path::Path::new("/usr/share/fcitx5/addon/openless.conf");
 
-    if !system_conf.exists() {
+    // 用户 XDG 安装：~/.local/ 下自编译安装的版本
+    let (user_so, user_conf) = if let Ok(home) = std::env::var("HOME") {
+        let home = std::path::PathBuf::from(home);
+        (
+            home.join(".local/lib/fcitx5/libopenless.so"),
+            home.join(".local/share/fcitx5/addon/openless.conf"),
+        )
+    } else {
+        (std::path::PathBuf::new(), std::path::PathBuf::new())
+    };
+
+    let conf_ok = user_conf.exists() || system_conf.exists();
+    let system_so_found = lib_dirs
+        .iter()
+        .find(|dir| std::path::Path::new(dir).join("libopenless.so").exists());
+    let so_ok = user_so.exists() || system_so_found.is_some();
+
+    // 用户手动安装过 ~/.local/ 版本，同时系统路径也有（deb 注入的）→
+    // fcitx5 优先加载用户路径的旧版，系统新版被忽略。
+    // 提醒用户删除 ~/.local/ 的旧插件。
+    if user_so.exists() && system_so_found.is_some() {
         log::warn!(
-            "[fcitx] fcitx5 addon config not installed at {:?}. \
-             The OpenLess package may be incomplete.",
-            system_conf
+            "[fcitx] fcitx5 plugin found in both ~/.local/ and system paths. \
+             fcitx5 will load the ~/.local/ version first, which may be outdated. \
+             Remove it if you want to use the system-installed version: rm -f {}",
+            user_so.display()
+        );
+    }
+
+    if !conf_ok {
+        log::warn!(
+            "[fcitx] fcitx5 addon config not found. \
+             The OpenLess package may be incomplete."
         );
         return;
     }
 
-    let found = lib_dirs.iter().any(|dir| {
-        std::path::Path::new(dir).join("libopenless.so").exists()
-    });
-
-    if !found {
+    if !so_ok {
         log::warn!(
-            "[fcitx] fcitx5 plugin .so not found in any of {:?}. \
+            "[fcitx] fcitx5 plugin .so not found in {:?} or {:?}. \
              The OpenLess package may be incomplete.",
-            lib_dirs
+            lib_dirs,
+            user_so
         );
     }
 }

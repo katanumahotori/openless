@@ -5,6 +5,7 @@ import { useTranslation } from 'react-i18next';
 import { Icon } from '../components/Icon';
 import { formatComboLabel } from '../lib/hotkey';
 import { getCredentials, listHistory } from '../lib/ipc';
+import { useMobileLayout } from '../lib/useMobileLayout';
 import type { CredentialsStatus, DictationSession, PolishMode } from '../lib/types';
 import { useHotkeySettings } from '../state/HotkeySettingsContext';
 import { Btn, Card, PageHeader, Pill } from './_atoms';
@@ -30,6 +31,8 @@ const ASR_NAME_KEY_BY_ID: Record<string, string> = {
   zhipu: 'asrZhipu',
   groq: 'asrGroq',
   whisper: 'asrWhisper',
+  openrouter: 'asrOpenrouter',
+  'xiaomi-mimo-asr': 'asrXiaomiMimo',
   'foundry-local-whisper': 'asrFoundryLocalWhisper',
   'sherpa-onnx-local': 'asrSherpaOnnxLocal',
   'local-qwen3': 'asrLocalQwen3',
@@ -51,6 +54,7 @@ const LLM_NAME_KEY_BY_ID: Record<string, string> = {
 
 export function Overview({ onOpenHistory }: OverviewProps) {
   const { t } = useTranslation();
+  const mobile = useMobileLayout();
   const modeLabel = useModeLabels();
   const [history, setHistory] = useState<DictationSession[]>([]);
   const [historyError, setHistoryError] = useState(false);
@@ -127,6 +131,34 @@ export function Overview({ onOpenHistory }: OverviewProps) {
     refreshCredentials();
   }, [refreshCredentials, prefs?.activeAsrProvider, prefs?.activeLlmProvider]);
 
+  // 凭据被保存后重新拉取状态（issue #532 / #573：在 Settings 中填写/更新凭据
+  // 但不切换提供商时，上面的 useEffect 不会重跑，导致概览页的状态仍停留在「未配置」）。
+  // 复用 refreshCredentials() 以带上 credentialsRequestSeq 防竞态。
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const handle = await listen('credentials:changed', () => {
+          if (cancelled) return;
+          refreshCredentials();
+        });
+        if (cancelled) {
+          handle();
+        } else {
+          unlisten = handle;
+        }
+      } catch {
+        // browser dev mock — 没有 Tauri event bridge
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refreshCredentials]);
+
   const metrics = useMemo(() => {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
@@ -168,7 +200,7 @@ export function Overview({ onOpenHistory }: OverviewProps) {
     <>
       <PageHeader title={t('overview.title')} />
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 18 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1fr', gap: 12, marginBottom: 18 }}>
         <ProviderCard
           kind={t('overview.asrKind')}
           name={asrProviderName}
@@ -183,7 +215,7 @@ export function Overview({ onOpenHistory }: OverviewProps) {
         />
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 18 }}>
+      <div className="ol-overview-hero" style={{ display: 'grid', gridTemplateColumns: mobile ? 'repeat(2, 1fr)' : 'repeat(4, 1fr)', gap: 12, marginBottom: 18 }}>
         <Metric icon="hash" label={t('overview.metricChars')} value={historyError ? '—' : metrics.charsToday.toLocaleString()} trend={historyError ? t('overview.historyLoadError') : t('overview.metricSegments', { count: metrics.segmentsToday })} />
         <Metric icon="mic" label={t('overview.metricDuration')} value={historyError ? '—' : formatDuration(metrics.totalDurationMs, t)} trend={historyError ? t('overview.historyLoadError') : ''} />
         <Metric icon="clock" label={t('overview.metricAvg')} value={historyError ? '—' : formatDuration(metrics.avgLatencyMs, t)} trend={historyError ? t('overview.historyLoadError') : metrics.segmentsToday > 0 ? t('overview.metricAvgTrend') : t('overview.metricNoData')} />
@@ -193,7 +225,7 @@ export function Overview({ onOpenHistory }: OverviewProps) {
       {/* 底部一行 = flex:1 撑满剩余高度（父 wrapper 是 display:flex/column）。
           只有「最近识别」内部允许滚动；其他卡片按内容自然高度，不破裂底部圆角。
           issue #243 follow-up：去掉外层 overflow 后底部圆角被裁的视觉问题。 */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1.4fr', gap: 12, flex: 1, minHeight: 0 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: mobile ? '1fr' : '1fr 1.4fr', gap: 12, flex: mobile ? undefined : 1, minHeight: mobile ? undefined : 0 }}>
         <Card padding={18} style={{ display: 'flex', flexDirection: 'column', minHeight: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
             <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--ol-ink-2)' }}>{t('overview.weekTitle')}</span>
@@ -325,7 +357,7 @@ function WeekChart({ data }: { data: number[] }) {
                 height: `${(v / max) * 80}px`,
                 minHeight: 2,
                 borderRadius: 4,
-                background: isToday ? 'var(--ol-blue)' : 'var(--ol-ink)',
+                background: isToday ? 'var(--ol-blue)' : 'var(--ol-ink-4)',
                 opacity: v === 0 ? 0.15 : isToday ? 1 : 0.85,
                 transition: 'height 0.18s var(--ol-motion-soft), opacity 0.18s var(--ol-motion-soft)',
               }}

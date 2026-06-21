@@ -1,25 +1,23 @@
+#![cfg_attr(target_os = "linux", allow(dead_code, unused_variables))]
 //! 跨平台光标位置文本插入。
 //!
 //! 通用步骤：先写剪贴板（模拟失败时用户能手动粘贴）→ 模拟粘贴快捷键。
 //! - macOS：用 CoreGraphics CGEvent 直接 post Cmd+V。
 //! - Windows / Linux：用 enigo 按 `PasteShortcut` 模拟。
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::time::Duration;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use once_cell::sync::Lazy;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 use parking_lot::Mutex;
 
 use crate::types::{InsertStatus, PasteShortcut};
 
-#[cfg(target_os = "windows")]
-const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(750);
-
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(750);
 
 pub struct TextInserter;
@@ -29,10 +27,27 @@ impl TextInserter {
         Self
     }
 
-    /// Windows/Linux 路径：写剪贴板 + 模拟 `paste_shortcut`。
+    /// Linux 路径：优先走 fcitx5 CommitText；插件不可用或提交失败时回退剪贴板粘贴。
+    #[cfg(target_os = "linux")]
+    pub fn insert(
+        &self,
+        text: &str,
+        restore_clipboard_after_paste: bool,
+        paste_shortcut: PasteShortcut,
+    ) -> InsertStatus {
+        insert_with_fcitx_or_clipboard_fallback(
+            text,
+            restore_clipboard_after_paste,
+            paste_shortcut,
+            crate::linux_fcitx::commit_text,
+            insert_with_clipboard_restore,
+        )
+    }
+
+    /// Windows 路径：写剪贴板 + 模拟 `paste_shortcut`。
     /// - `restore_clipboard_after_paste`：粘贴后是否恢复用户原剪贴板。
     /// - `paste_shortcut`：模拟按下的粘贴快捷键（如终端可能要 Ctrl+Shift+V）。
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     pub fn insert(
         &self,
         text: &str,
@@ -42,32 +57,20 @@ impl TextInserter {
         if text.is_empty() {
             return InsertStatus::CopiedFallback;
         }
-        // Linux: 始终优先使用 fcitx5 CommitText 直写（支持中文）。
-        // 如果插件未加载，降级到剪贴板拷贝（统一路径，不单独维护 enigo XTest）。
-        #[cfg(target_os = "linux")]
-        {
-            match crate::linux_fcitx::commit_text(text) {
-                Ok(()) => return InsertStatus::Inserted,
-                Err(e) => {
-                    log::warn!("[insertion] fcitx commit_text failed: {e}, fallback to clipboard only");
-                    if copy_to_clipboard(text) {
-                        return InsertStatus::CopiedFallback;
-                    }
-                    return InsertStatus::Failed;
-                }
-            }
-        }
         insert_with_clipboard_restore(text, restore_clipboard_after_paste, paste_shortcut)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
     pub fn insert_via_clipboard_fallback(
         &self,
         text: &str,
         restore_clipboard_after_paste: bool,
         paste_shortcut: PasteShortcut,
     ) -> InsertStatus {
-        self.insert(text, restore_clipboard_after_paste, paste_shortcut)
+        if text.is_empty() {
+            return InsertStatus::CopiedFallback;
+        }
+        insert_with_clipboard_restore(text, restore_clipboard_after_paste, paste_shortcut)
     }
 
     #[cfg(target_os = "windows")]
@@ -84,8 +87,41 @@ impl TextInserter {
         }
     }
 
-    /// macOS 路径：写剪贴板 + post Cmd+V。两个 `_` 参数仅为对齐跨平台签名。
+    /// macOS 路径：保存原剪贴板 → 写转写文字 → post Cmd+V → 按需恢复原剪贴板。
+    /// `_paste_shortcut` 在 macOS 不使用（固定 Cmd+V），仅为对齐跨平台签名。
     #[cfg(target_os = "macos")]
+    pub fn insert(
+        &self,
+        text: &str,
+        restore_clipboard_after_paste: bool,
+        _paste_shortcut: PasteShortcut,
+    ) -> InsertStatus {
+        if text.is_empty() {
+            return InsertStatus::CopiedFallback;
+        }
+        // issue #525：先记下用户原剪贴板，粘贴成功且「恢复剪贴板」开关开启时再恢复，避免覆盖
+        // 用户手动复制的内容。此前 macOS 完全不实现恢复（恢复机制曾被 cfg 排除），导致设置里
+        // 的开关在 macOS 上无效——无论开关如何，剪贴板都被留成转写文字。
+        let restore_plan = match copy_to_clipboard_with_restore_plan(text) {
+            Ok(plan) => plan,
+            Err(err) => {
+                log::error!("[insertion] clipboard write failed: {}", err);
+                return InsertStatus::Failed;
+            }
+        };
+        if let Err(err) = simulate_paste() {
+            log::warn!("[insertion] simulated paste failed: {}", err);
+            // 粘贴失败：把转写文字留在剪贴板供用户手动粘贴，不恢复。
+            return InsertStatus::CopiedFallback;
+        }
+        if restore_clipboard_after_paste {
+            schedule_clipboard_restore(restore_plan);
+        }
+        insertion_success_status()
+    }
+
+    /// Android：跨应用输入由 dictation 流程按用户策略处理；通用插入只写剪贴板兜底。
+    #[cfg(target_os = "android")]
     pub fn insert(
         &self,
         text: &str,
@@ -95,10 +131,7 @@ impl TextInserter {
         if text.is_empty() {
             return InsertStatus::CopiedFallback;
         }
-        if !copy_to_clipboard(text) {
-            return InsertStatus::Failed;
-        }
-        macos_insert_status_after_paste(simulate_paste())
+        self.copy_fallback(text)
     }
 
     /// 只写剪贴板、不模拟粘贴。用于目标控件活跃状态无法验证时的兜底路径。
@@ -114,13 +147,28 @@ impl TextInserter {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn macos_insert_status_after_paste(result: Result<(), String>) -> InsertStatus {
-    match result {
-        Ok(()) => insertion_success_status(),
+#[cfg(target_os = "linux")]
+fn insert_with_fcitx_or_clipboard_fallback<C, F>(
+    text: &str,
+    restore_clipboard_after_paste: bool,
+    paste_shortcut: PasteShortcut,
+    commit_text: C,
+    clipboard_fallback: F,
+) -> InsertStatus
+where
+    C: FnOnce(&str) -> Result<(), String>,
+    F: FnOnce(&str, bool, PasteShortcut) -> InsertStatus,
+{
+    if text.is_empty() {
+        return InsertStatus::CopiedFallback;
+    }
+    match commit_text(text) {
+        Ok(()) => InsertStatus::Inserted,
         Err(err) => {
-            log::warn!("[insertion] simulated paste failed: {}", err);
-            InsertStatus::CopiedFallback
+            log::warn!(
+                "[insertion] fcitx commit_text failed, falling back to clipboard paste: {err}"
+            );
+            clipboard_fallback(text, restore_clipboard_after_paste, paste_shortcut)
         }
     }
 }
@@ -131,27 +179,28 @@ impl Default for TextInserter {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug)]
 struct ClipboardRestorePlan {
     inserted_text: String,
     previous_text: Option<String>,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 #[derive(Debug, Clone)]
 struct PendingClipboardRestore {
     latest_restore_id: u64,
     original_text: Option<String>,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 static NEXT_CLIPBOARD_RESTORE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 static PENDING_CLIPBOARD_RESTORE: Lazy<Mutex<Option<PendingClipboardRestore>>> =
     Lazy::new(|| Mutex::new(None));
 
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn copy_to_clipboard(text: &str) -> bool {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(c) => c,
@@ -167,7 +216,28 @@ fn copy_to_clipboard(text: &str) -> bool {
     true
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn copy_to_clipboard(text: &str) -> bool {
+    #[cfg(target_os = "android")]
+    {
+        return crate::android::jni::android::with_android_env(|env, context| {
+            crate::android::jni::android::copy_to_clipboard(env, context, text)
+        })
+        .unwrap_or_else(|error| {
+            log::error!("[insertion] android clipboard failed: {error}");
+            false
+        });
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+        let _ = text;
+        log::warn!("[insertion] mobile clipboard fallback unavailable");
+        false
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn copy_to_clipboard_with_restore_plan(text: &str) -> Result<ClipboardRestorePlan, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     let previous_text = match clipboard.get_text() {
@@ -189,7 +259,7 @@ fn copy_to_clipboard_with_restore_plan(text: &str) -> Result<ClipboardRestorePla
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
 fn insert_with_clipboard_restore(
     text: &str,
     restore_clipboard_after_paste: bool,
@@ -214,7 +284,7 @@ fn insert_with_clipboard_restore(
     insertion_success_status()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn schedule_clipboard_restore(plan: ClipboardRestorePlan) {
     let (restore_id, original_text) =
         remember_pending_clipboard_restore(plan.previous_text.clone());
@@ -223,7 +293,7 @@ fn schedule_clipboard_restore(plan: ClipboardRestorePlan) {
     });
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn remember_pending_clipboard_restore(previous_text: Option<String>) -> (u64, Option<String>) {
     let restore_id = NEXT_CLIPBOARD_RESTORE_ID.fetch_add(1, Ordering::SeqCst);
     let original_text = {
@@ -241,7 +311,7 @@ fn remember_pending_clipboard_restore(previous_text: Option<String>) -> (u64, Op
     (restore_id, original_text)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn restore_clipboard_after_delay(
     plan: ClipboardRestorePlan,
     original_text: Option<String>,
@@ -292,7 +362,7 @@ fn restore_clipboard_after_delay(
     clear_pending_clipboard_restore(restore_id);
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn is_latest_clipboard_restore(restore_id: u64) -> bool {
     matches!(
         PENDING_CLIPBOARD_RESTORE.lock().as_ref(),
@@ -300,7 +370,7 @@ fn is_latest_clipboard_restore(restore_id: u64) -> bool {
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn clear_pending_clipboard_restore(restore_id: u64) {
     let mut pending = PENDING_CLIPBOARD_RESTORE.lock();
     if matches!(pending.as_ref(), Some(batch) if batch.latest_restore_id == restore_id) {
@@ -308,7 +378,7 @@ fn clear_pending_clipboard_restore(restore_id: u64) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn should_restore_clipboard(current_text: Option<&str>, inserted_text: &str) -> bool {
     matches!(current_text, Some(current) if current == inserted_text)
 }
@@ -325,7 +395,7 @@ fn simulate_paste() -> Result<(), String> {
 }
 
 /// 把 `PasteShortcut` 拆成 `(modifiers, primary)`，顺序决定按下/释放顺序。
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
 fn paste_keys(shortcut: PasteShortcut) -> (Vec<enigo::Key>, enigo::Key) {
     use enigo::Key;
     match shortcut {
@@ -335,7 +405,7 @@ fn paste_keys(shortcut: PasteShortcut) -> (Vec<enigo::Key>, enigo::Key) {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
 fn simulate_paste(shortcut: PasteShortcut) -> Result<(), String> {
     use enigo::{Direction, Enigo, Keyboard, Settings};
     let (modifiers, primary) = paste_keys(shortcut);
@@ -379,7 +449,7 @@ fn insertion_success_status() -> InsertStatus {
     InsertStatus::Inserted
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
 fn insertion_success_status() -> InsertStatus {
     InsertStatus::PasteSent
 }
@@ -529,7 +599,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn restore_only_when_clipboard_still_holds_inserted_text() {
         assert!(should_restore_clipboard(
             Some("dictated text"),
@@ -544,7 +614,7 @@ mod tests {
 
     /// 配置的快捷键必须真实映射到对应按键。只比较 modifier 数 + 主键，规避 enigo 内部 PartialEq。
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
     fn paste_keys_match_configured_shortcut() {
         use enigo::Key;
 
@@ -573,7 +643,7 @@ mod tests {
             inserter.insert("", true, PasteShortcut::CtrlV),
             InsertStatus::CopiedFallback
         );
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "android", target_os = "ios")))]
         {
             assert_eq!(
                 inserter.insert_via_clipboard_fallback("", true, PasteShortcut::CtrlV),
@@ -584,7 +654,82 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    fn linux_commit_text_success_skips_clipboard_fallback() {
+        let mut fallback_called = false;
+
+        let status = insert_with_fcitx_or_clipboard_fallback(
+            "dictated text",
+            true,
+            PasteShortcut::CtrlV,
+            |text| {
+                assert_eq!(text, "dictated text");
+                Ok(())
+            },
+            |_, _, _| {
+                fallback_called = true;
+                InsertStatus::CopiedFallback
+            },
+        );
+
+        assert_eq!(status, InsertStatus::Inserted);
+        assert!(!fallback_called);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_commit_text_failure_uses_clipboard_fallback() {
+        let mut fallback_args = None;
+
+        let status = insert_with_fcitx_or_clipboard_fallback(
+            "dictated text",
+            true,
+            PasteShortcut::CtrlShiftV,
+            |_| Err("plugin unavailable".to_string()),
+            |text, restore_clipboard_after_paste, paste_shortcut| {
+                fallback_args = Some((
+                    text.to_string(),
+                    restore_clipboard_after_paste,
+                    paste_shortcut,
+                ));
+                InsertStatus::CopiedFallback
+            },
+        );
+
+        assert_eq!(status, InsertStatus::CopiedFallback);
+        assert_eq!(
+            fallback_args,
+            Some(("dictated text".to_string(), true, PasteShortcut::CtrlShiftV))
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_empty_insert_skips_commit_text_and_clipboard_fallback() {
+        let mut commit_called = false;
+        let mut fallback_called = false;
+
+        let status = insert_with_fcitx_or_clipboard_fallback(
+            "",
+            true,
+            PasteShortcut::CtrlV,
+            |_| {
+                commit_called = true;
+                Ok(())
+            },
+            |_, _, _| {
+                fallback_called = true;
+                InsertStatus::CopiedFallback
+            },
+        );
+
+        assert_eq!(status, InsertStatus::CopiedFallback);
+        assert!(!commit_called);
+        assert!(!fallback_called);
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn pending_clipboard_restore_keeps_first_original_until_latest_restore() {
         *PENDING_CLIPBOARD_RESTORE.lock() = None;
 
@@ -606,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     fn clipboard_restore_skips_when_clipboard_no_longer_matches_inserted_text() {
         assert!(should_restore_clipboard(
             Some("dictated text"),
@@ -621,15 +766,18 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn macos_direct_write_or_paste_failure_keeps_copied_fallback_available() {
-        assert_eq!(
-            macos_insert_status_after_paste(Ok(())),
-            InsertStatus::Inserted
-        );
-        assert_eq!(
-            macos_insert_status_after_paste(Err("AX direct write unavailable".to_string())),
-            InsertStatus::CopiedFallback
-        );
+    fn macos_paste_success_reports_inserted_and_guards_restore() {
+        // 粘贴成功 → Inserted；恢复仅在剪贴板仍是刚插入的转写文字时进行（issue #525），
+        // 即「恢复剪贴板」开关在 macOS 上真正生效。
+        assert_eq!(insertion_success_status(), InsertStatus::Inserted);
+        assert!(should_restore_clipboard(
+            Some("dictated text"),
+            "dictated text"
+        ));
+        assert!(!should_restore_clipboard(
+            Some("user changed clipboard"),
+            "dictated text"
+        ));
     }
 
     #[test]

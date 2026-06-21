@@ -2,6 +2,26 @@
 // All keys are camelCase (Rust serializes with #[serde(rename_all = "camelCase")]).
 // PolishMode is an exception — Rust uses lowercase serialization.
 
+import type {
+  AndroidAccessibilityStatus,
+  AndroidInsertStrategy,
+  AndroidOverlayActivationMode,
+  AndroidOverlayCancelSwipeDirection,
+  AndroidOverlayLeftSwipeAction,
+  AndroidOverlayStatus,
+  AndroidOverlayTrigger,
+} from '../../android/frontend/lib/androidTypes';
+
+export type {
+  AndroidAccessibilityStatus,
+  AndroidInsertStrategy,
+  AndroidOverlayActivationMode,
+  AndroidOverlayCancelSwipeDirection,
+  AndroidOverlayLeftSwipeAction,
+  AndroidOverlayStatus,
+  AndroidOverlayTrigger,
+};
+
 export type PolishMode = 'raw' | 'light' | 'structured' | 'formal';
 
 export type InsertStatus = 'inserted' | 'pasteSent' | 'copiedFallback' | 'failed';
@@ -12,6 +32,9 @@ export interface DictationSession {
   rawTranscript: string;
   finalText: string;
   mode: PolishMode;
+  stylePackId: string | null;
+  translationActive: boolean;
+  polishSource: string | null;
   appBundleId: string | null;
   appName: string | null;
   insertStatus: InsertStatus;
@@ -60,6 +83,7 @@ export type HotkeyTrigger =
   | 'rightCommand'
   | 'fn'
   | 'rightAlt'
+  | 'mediaPlayPause'
   | 'custom';
 
 export type HotkeyMode = 'toggle' | 'hold' | 'doubleClick';
@@ -74,7 +98,7 @@ export interface HotkeyBinding {
   keys?: HotkeyKey[] | null;
 }
 
-export type HotkeyAdapterKind = 'macEventTap' | 'windowsLowLevel' | 'fcitx5';
+export type HotkeyAdapterKind = 'macEventTap' | 'windowsLowLevel' | 'fcitx5' | 'unavailable';
 
 export interface HotkeyCapability {
   adapter: HotkeyAdapterKind;
@@ -113,6 +137,13 @@ export type QaHotkeyBinding = ShortcutBinding;
 /** 自定义录音组合键绑定。当 hotkey.trigger == 'custom' 时使用。 */
 export type ComboBinding = ShortcutBinding;
 
+export type CodingAgentProviderId = "claude-code-cli" | "opencode-cli";
+export type CodingAgentPermissionMode =
+  | "plan"
+  | "default"
+  | "acceptEdits"
+  | "bypassPermissions";
+
 /** 模拟粘贴时按下的快捷键。仅 Windows/Linux 生效；macOS 走 AX 直写。
  *  - ctrlV       : 标准粘贴（默认；大多数编辑器、浏览器、IDE）
  *  - ctrlShiftV  : kitty / alacritty / wezterm / gnome-terminal / foot 等终端
@@ -133,9 +164,11 @@ export interface WindowsImeStatus {
   dllPath: string | null;
 }
 
-/** Auto-update 渠道偏好。stable = 跟正式版（默认）；beta = Settings 里多一个
- *  手动下载 Beta 的入口。不影响 plugin-updater 的自动检查路径。 */
+/** 后台自动更新渠道。stable = 查正式版 manifest（默认）；beta = 查
+ *  latest-android-{arch}-beta.json。手动「检查正式版/Beta 更新」按钮不受此字段影响。 */
 export type UpdateChannel = 'stable' | 'beta';
+
+export type ThemeMode = 'system' | 'light' | 'dark';
 
 export interface CustomStylePrompts {
   raw: string;
@@ -253,10 +286,26 @@ export interface UserPreferences {
   customComboHotkey: ComboBinding | null;
   /** 录音中触发翻译的全局快捷键。默认 Shift。 */
   translationHotkey: ShortcutBinding;
-  /** 切换到上一个润色风格的全局快捷键。 */
-  switchStyleHotkey: ShortcutBinding;
-  /** 打开 OpenLess 主窗口的全局快捷键。 */
-  openAppHotkey: ShortcutBinding;
+  /** 切换到上一个润色风格的全局快捷键。null = 用户已停用（issue #576）。 */
+  switchStyleHotkey: ShortcutBinding | null;
+  /** 打开 OpenLess 主窗口的全局快捷键。null = 用户已停用（issue #576）。 */
+  openAppHotkey: ShortcutBinding | null;
+  /** Less Computer：是否启用。默认关闭。 */
+  codingAgentEnabled: boolean;
+  /** Agent 后端：claude-code-cli（默认）/ opencode-cli。 */
+  codingAgentProvider: CodingAgentProviderId;
+  /** Agent 模型，null = 运行时取便宜默认（sonnet）。 */
+  codingAgentModel: string | null;
+  /** 权限模式：plan/default/acceptEdits/bypassPermissions。 */
+  codingAgentPermissionMode: CodingAgentPermissionMode;
+  /** Agent 工作目录，null = 临时目录。 */
+  codingAgentWorkdir: string | null;
+  /** Less Computer 按住说话快捷键。null = 停用；目前仅 macOS 显示/生效。 */
+  codingAgentVoiceHotkey: ShortcutBinding | null;
+  /** 热键 1：语音 Agent 面板键。null = 停用。 */
+  codingAgentPanelHotkey: ShortcutBinding | null;
+  /** 热键 2：快取用键（选中→Claude→回插）。null = 未配置。 */
+  codingAgentQuickHotkey: ShortcutBinding | null;
   /** 本地 Qwen3-ASR 当前激活的模型 id。仅在 activeAsrProvider === 'local-qwen3' 时有意义。 */
   localAsrActiveModel: string;
   /** 本地模型下载源镜像（'huggingface' / 'hf-mirror'）。 */
@@ -285,8 +334,10 @@ export interface UserPreferences {
   /** 启动时静默运行（不弹主窗口）。Windows 开机自启场景常用——只想要后台 + 托盘，
    *  不想被主窗口打扰。开后所有启动路径都不弹窗，从菜单栏 / 托盘进入主窗口。默认 false。 */
   startMinimized: boolean;
-  /** 自动更新渠道。'stable'（默认）= plugin-updater 仅检查正式版；
-   *  'beta' = Settings → About 出现手动下载 Beta 的入口。 */
+  /** UI theme preference: follow OS, light, or dark. */
+  themeMode: ThemeMode;
+  /** 后台自动更新渠道。stable（默认）= AutoUpdateGate 查正式版 manifest；
+   *  beta = 查 Beta manifest。About / Advanced 的手动检查按钮各自固定 stable/beta。 */
   updateChannel: UpdateChannel;
   /** 流式输入：润色 SSE 一边到达一边逐字模拟键盘事件输出到当前焦点。开启后用户感知到
    *  的处理时延显著降低。v1 限定 macOS + OpenAI-compatible provider，其他配置自动回落
@@ -298,8 +349,10 @@ export interface UserPreferences {
   /** 流式输入成功后是否把最终润色文本写回剪贴板。开启后 Cmd+V 还能重复粘贴该次输出，
    *  与一次性路径行为对齐。默认 true。 */
   streamingInsertSaveClipboard: boolean;
-  /** 主窗口启动 + 后台每 60 分钟自动检查云端新版本。默认 true。
-   *  关闭后仅 Settings → 关于 的「检查更新」手动按钮可用。 */
+  /** 主窗口启动 + 后台每 60 分钟自动检查更新。默认 true。
+   *  Android：开启后自动检查并下载，校验后打开系统安装器。
+   *  桌面：开启后自动检查，发现更新弹窗由用户确认安装。
+   *  关闭后仅 Settings 手动「检查更新」按钮可用。 */
   autoUpdateCheck: boolean;
   /** 历史记录上限（条数）。null = 走默认 200；5..=200 之间为用户自定义。 */
   historyMaxEntries: number | null;
@@ -313,6 +366,26 @@ export interface UserPreferences {
   marketplaceBaseUrl: string;
   /** Marketplace dev-mode 模拟登录用户名（GitHub login 风格）。生产换 OAuth token 后此字段废弃。 */
   marketplaceDevLogin: string;
+  /** 是否启用远程输入（局域网手机录音）HTTPS+WS 服务。默认 false。 */
+  remoteInputEnabled: boolean;
+  /** 远程输入服务监听端口（HTTPS）。默认 8443。 */
+  remoteInputPort: number;
+  /** 远程输入配对码（6 位数字）。空 = server 首次启动时随机生成。 */
+  remoteInputPin: string;
+  /** 手机录音页默认交互方式：'toggle'（点击切换）/ 'hold'（按住说话）。 */
+  remoteInputDefaultMode: 'toggle' | 'hold';
+  /** Android: cross-app dictation insert strategy. */
+  androidInsertStrategy: AndroidInsertStrategy;
+  /** Android: floating overlay visibility trigger mode. */
+  androidOverlayTrigger: AndroidOverlayTrigger;
+  /** Android: how the floating overlay enters the armed interaction state. */
+  androidOverlayActivationMode: AndroidOverlayActivationMode;
+  /** Android: action performed by left swiping while the overlay is armed. */
+  androidOverlayLeftSwipeAction: AndroidOverlayLeftSwipeAction;
+  /** Android: vertical swipe direction that cancels recording. */
+  androidOverlayCancelSwipeDirection: AndroidOverlayCancelSwipeDirection;
+  /** Android: floating overlay control diameter in dp. */
+  androidOverlaySizeDp: number;
 }
 
 export interface MarketplaceListItem {
@@ -376,6 +449,28 @@ export interface QaStatePayload {
   chunk?: string;
 }
 
+/**
+ * Less Computer 语音 Agent 浮窗事件（窗口 label = "less-computer"，事件名
+ * `less-computer:event`）。后端按 `kind` 标记，前端据此把交互渲染成聊天结构。
+ */
+export type LessComputerEvent =
+  /** 一轮用户气泡（语音指令转写）。fresh=true 表示新会话（清空历史）；否则追加为后续轮次。 */
+  | { kind: 'user'; text: string; fresh?: boolean }
+  /** Agent 启动，进入运行态。 */
+  | { kind: 'started' }
+  /** 流式回复增量（来自 CodingAgentEvent::Delta）。 */
+  | { kind: 'delta'; text: string }
+  /** 工具调用提示（来自 CodingAgentEvent::ToolUse，如 "Bash"）。 */
+  | { kind: 'tool'; name: string }
+  /** 内联审批卡：高风险动作被护栏拦下，等用户 Approve / Deny。 */
+  | { kind: 'approval'; token: string; command: string; reason: string }
+  /** 运行完成：最终结果 + 成本（美元）。 */
+  | { kind: 'completed'; text: string; costUsd?: number | null }
+  /** 用户从胶囊取消正在运行的 Agent。 */
+  | { kind: 'cancelled' }
+  /** 运行出错。 */
+  | { kind: 'error'; message: string };
+
 /** 内置语言列表 — 前端 Settings UI 用，后端只接收原生名字符串拼 prompt。
  *  添加新语言时直接在这里加一项（原生名），无需修改后端。 */
 export const SUPPORTED_LANGUAGES: readonly string[] = [
@@ -413,6 +508,8 @@ export interface CapsulePayload {
   insertedChars: number | null;
   /** 当前 session 是否处于翻译模式（用户已按过 Shift）。详见 issue #4。 */
   translation: boolean;
+  /** 当前是否是 Less Computer 会话：处理态文案显示 "using" 而非 "thinking"。 */
+  operating?: boolean;
 }
 
 export interface CredentialsStatus {
@@ -438,3 +535,18 @@ export type PermissionStatus =
   | 'notDetermined'
   | 'restricted'
   | 'notApplicable';
+
+/** Runtime platform kind returned by `get_platform_capabilities`. */
+export type PlatformKind = 'desktop' | 'android' | 'mobile';
+
+/** Feature flags for desktop vs Android APK UI gating. Mirrors src-tauri PlatformCapabilities. */
+export interface PlatformCapabilities {
+  platform: PlatformKind;
+  supportsDesktopHotkey: boolean;
+  supportsTray: boolean;
+  supportsOverlay: boolean;
+  supportsImeInput: boolean;
+  supportsLocalAsr: boolean;
+  supportsInAppDictation: boolean;
+  supportsAutoUpdate: boolean;
+}

@@ -1,47 +1,147 @@
-import { useEffect, useState } from 'react';
-import { AutoUpdateGate } from './components/AutoUpdateGate';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Capsule } from './components/Capsule';
-import { FloatingShell } from './components/FloatingShell';
-import { Onboarding } from './components/Onboarding';
 import { detectOS, type OS } from './components/WindowChrome';
 import {
   checkAccessibilityPermission,
   checkMicrophonePermission,
   getHotkeyStatus,
   getSettings,
+  getPlatformCapabilities,
   handleWindowHotkeyEvent,
   isTauri,
+  qaWindowDismiss,
 } from './lib/ipc';
+import type { PlatformCapabilities } from './lib/types';
 import {
   isWindowHotkeyKeyboardCandidate,
   windowMouseHotkeyCode,
 } from './lib/windowHotkeyFallback';
-import { QaPanel } from './pages/QaPanel';
 import { HotkeySettingsProvider } from './state/HotkeySettingsContext';
+
+// 各窗口/重页面懒加载,让每个 webview 只下载并解析自己用到的那部分代码。原本所有窗口
+// (主设置 / 胶囊 / QA / Less Computer / glow)共用一个打包产物,导致 5 个常驻 WebKit
+// 进程都把整套设置 UI(FloatingShell + Style/Marketplace/LocalAsr…)和聊天面板加载进来,
+// 常驻内存离谱。拆开后胶囊/glow 这类轻窗口不再加载设置/聊天代码。胶囊保持 eager:
+// 它是听写实时反馈、对首帧延迟敏感,且体积很小。
+const AutoUpdateGate = lazy(() =>
+  import('./components/AutoUpdateGate').then(m => ({ default: m.AutoUpdateGate })),
+);
+const FloatingShell = lazy(() =>
+  import('./components/FloatingShell').then(m => ({ default: m.FloatingShell })),
+);
+const Onboarding = lazy(() =>
+  import('./components/Onboarding').then(m => ({ default: m.Onboarding })),
+);
+const QaPanel = lazy(() => import('./pages/QaPanel').then(m => ({ default: m.QaPanel })));
+const LessComputerPanel = lazy(() =>
+  import('./pages/LessComputerPanel').then(m => ({ default: m.LessComputerPanel })),
+);
+const LessComputerGlow = lazy(() =>
+  import('./pages/LessComputerGlow').then(m => ({ default: m.LessComputerGlow })),
+);
 
 interface AppProps {
   isCapsule: boolean;
   isQa: boolean;
+  isLessComputer: boolean;
+  isLessComputerGlow: boolean;
   forcedOs?: OS | null;
 }
 
-type Gate = 'checking' | 'onboarding' | 'ready';
+type Gate = 'onboarding' | 'ready';
+const ANDROID_SETUP_WIZARD_COMPLETE_KEY = 'openless.androidSetupWizardComplete';
 
-export function App({ isCapsule, isQa, forcedOs }: AppProps) {
+export function App({ isCapsule, isQa, isLessComputer, isLessComputerGlow, forcedOs }: AppProps) {
   if (isCapsule) {
     return <Capsule />;
   }
   if (isQa) {
-    return <QaPanel />;
+    return (
+      <Suspense fallback={null}>
+        <QaPanel />
+      </Suspense>
+    );
+  }
+  if (isLessComputer) {
+    return (
+      <Suspense fallback={null}>
+        <LessComputerPanel />
+      </Suspense>
+    );
+  }
+  if (isLessComputerGlow) {
+    return (
+      <Suspense fallback={null}>
+        <LessComputerGlow />
+      </Suspense>
+    );
   }
 
   const os = forcedOs ?? detectOS();
   // Windows 启动不应被权限探测阻塞首屏。
-  const [gate, setGate] = useState<Gate>(isTauri ? 'checking' : 'ready');
+  const [gate, setGate] = useState<Gate>('ready');
+  const [platformCaps, setPlatformCaps] = useState<PlatformCapabilities | null>(null);
+  const [mobileQaOpen, setMobileQaOpen] = useState(false);
+  const completeOnboarding = () => {
+    if (platformCaps?.platform === 'android') {
+      localStorage.setItem(ANDROID_SETUP_WIZARD_COMPLETE_KEY, '1');
+    }
+    setGate('ready');
+  };
+  useEffect(() => {
+    if (!isTauri) return;
+    void getPlatformCapabilities().then(setPlatformCaps);
+  }, []);
+
+  useEffect(() => {
+    if (!isTauri || platformCaps?.platform !== 'android') return;
+    let unlistenState: (() => void) | undefined;
+    let unlistenDismiss: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const stateHandle = await listen('qa:state', () => {
+          console.info('[qa] android qa:state received; opening embedded panel');
+          setMobileQaOpen(true);
+        });
+        const dismissHandle = await listen('qa:dismiss', () => {
+          console.info('[qa] android qa:dismiss received; closing embedded panel');
+          setMobileQaOpen(false);
+        });
+        if (cancelled) {
+          stateHandle();
+          dismissHandle();
+        } else {
+          unlistenState = stateHandle;
+          unlistenDismiss = dismissHandle;
+        }
+      } catch (error) {
+        console.warn('[qa] mobile route listener setup failed', error);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlistenState?.();
+      unlistenDismiss?.();
+    };
+  }, [platformCaps?.platform]);
+
+  useEffect(() => {
+    if (!mobileQaOpen || platformCaps?.platform !== 'android') return;
+    window.history.pushState({ openlessQa: true }, '', window.location.href);
+    const onPopState = () => {
+      setMobileQaOpen(false);
+      void qaWindowDismiss().catch(error => console.warn('[qa] mobile back dismiss failed', error));
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => {
+      window.removeEventListener('popstate', onPopState);
+    };
+  }, [mobileQaOpen, platformCaps?.platform]);
 
   useEffect(() => {
     if (!isTauri) return;
-    if (os === 'win' && gate === 'checking') return;
     let cancelled = false;
     requestAnimationFrame(() => {
       if (cancelled) return;
@@ -79,19 +179,36 @@ export function App({ isCapsule, isQa, forcedOs }: AppProps) {
     return () => {
       cancelled = true;
     };
-  }, [gate, os]);
+  }, [os]);
 
   useEffect(() => {
     if (!isTauri) return;
     let cancelled = false;
 
-    if (os === 'win') {
-      // 超时保护：50 次 × 200ms = 10s。hotkey hook 永远 starting（被反作弊 / EDR
-      // / UAC 拦）时不让 UI 死锁灰屏，过 10s 强 setGate('ready') 让用户进
-      // Permissions 页看 hotkey_status.lastError 处理。详见 issue #163。
-      const POLL_INTERVAL_MS = 200;
-      const POLL_MAX_ATTEMPTS = 50;
-      const pollHotkeyStatus = async () => {
+    void (async () => {
+      const caps = await getPlatformCapabilities();
+      if (cancelled) return;
+
+      if (caps.platform === 'android') {
+        if (localStorage.getItem(ANDROID_SETUP_WIZARD_COMPLETE_KEY) !== '1') {
+          setGate('onboarding');
+          return;
+        }
+        const m = await checkMicrophonePermission();
+        if (cancelled) return;
+        // notDetermined is non-blocking on Android — show grant flow in-app instead
+        // of trapping users on onboarding while JNI/runtime permission is pending.
+        const blocked = m === 'denied' || m === 'restricted';
+        setGate(blocked ? 'onboarding' : 'ready');
+        return;
+      }
+
+      if (os === 'win') {
+        // 超时保护：50 次 × 200ms = 10s。hotkey hook 永远 starting（被反作弊 / EDR
+        // / UAC 拦）时不让 UI 死锁灰屏，过 10s 强 setGate('ready') 让用户进
+        // Permissions 页看 hotkey_status.lastError 处理。详见 issue #163。
+        const POLL_INTERVAL_MS = 200;
+        const POLL_MAX_ATTEMPTS = 50;
         let attempts = 0;
         while (!cancelled && attempts < POLL_MAX_ATTEMPTS) {
           attempts += 1;
@@ -109,19 +226,9 @@ export function App({ isCapsule, isQa, forcedOs }: AppProps) {
           );
           setGate('ready');
         }
-      };
-      void pollHotkeyStatus().catch(error => {
-        console.warn('[startup] hotkey status polling failed', error);
-        if (!cancelled) {
-          setGate('ready');
-        }
-      });
-      return () => {
-        cancelled = true;
-      };
-    }
+        return;
+      }
 
-    (async () => {
       const [a, m] = await Promise.all([
         checkAccessibilityPermission(),
         checkMicrophonePermission(),
@@ -130,7 +237,13 @@ export function App({ isCapsule, isQa, forcedOs }: AppProps) {
       const aOk = a === 'granted' || a === 'notApplicable';
       const mOk = m === 'granted' || m === 'notApplicable';
       setGate(aOk && mOk ? 'ready' : 'onboarding');
-    })();
+    })().catch(error => {
+      console.warn('[startup] permission gate failed', error);
+      if (!cancelled) {
+        setGate('ready');
+      }
+    });
+
     return () => {
       cancelled = true;
     };
@@ -169,53 +282,29 @@ export function App({ isCapsule, isQa, forcedOs }: AppProps) {
     };
   }, [os]);
 
-  if (gate === 'checking') {
-    return <StartupShell />;
-  }
   return (
-    <HotkeySettingsProvider>
-      {gate === 'onboarding' ? <Onboarding onComplete={() => setGate('ready')} /> : <FloatingShell os={os} />}
-      {gate === 'ready' && <AutoUpdateGate />}
-    </HotkeySettingsProvider>
-  );
-}
-
-function StartupShell() {
-  // 用透明背景：main window 是 transparent + macOSPrivateApi（NSVisualEffectView 磨砂）。
-  // 之前用 linear-gradient(rgba(245,245,247,0.96)...) 会盖过 macOS vibrancy，启动时
-  // 长时间在 'checking' phase（凭据迁移 / 权限 probe 慢）会让窗口看起来「左侧白屏 +
-  // 右侧磨砂」割裂。现在背景全透明，让磨砂统一展开，提示文字 + icon 用一个轻量
-  // pill 卡片承载，跟 capsule 视觉一致。
-  return (
-    <div
-      style={{
-        minHeight: '100vh',
-        display: 'grid',
-        placeItems: 'center',
-        background: 'transparent',
-        color: 'var(--ol-ink-3)',
-        fontFamily: 'var(--ol-font-sans)',
-      }}
-    >
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 10,
-          fontSize: 13,
-          fontWeight: 500,
-          padding: '10px 16px',
-          borderRadius: 999,
-          background: 'rgba(255, 255, 255, 0.55)',
-          backdropFilter: 'blur(20px) saturate(180%)',
-          WebkitBackdropFilter: 'blur(20px) saturate(180%)',
-          border: '0.5px solid rgba(0, 0, 0, 0.06)',
-          boxShadow: '0 4px 14px -6px rgba(0, 0, 0, 0.18), 0 0 0 0.5px rgba(0,0,0,0.04)',
-        }}
-      >
-        <img src="AppIcon.png" alt="" style={{ width: 18, height: 18, borderRadius: 4 }} />
-        <span>OpenLess 正在启动</span>
-      </div>
-    </div>
+    <Suspense fallback={null}>
+      <HotkeySettingsProvider>
+        {platformCaps?.platform === 'android' && (
+          <div style={{ display: mobileQaOpen ? 'block' : 'none', height: '100%' }}>
+            <QaPanel
+              embedded
+              onRequestClose={() => {
+                setMobileQaOpen(false);
+                if (window.history.state?.openlessQa === true) {
+                  window.history.back();
+                }
+              }}
+            />
+          </div>
+        )}
+        {!mobileQaOpen && (gate === 'onboarding' ? (
+          <Onboarding onComplete={completeOnboarding} />
+        ) : (
+          <FloatingShell os={os} />
+        ))}
+        {gate === 'ready' && platformCaps?.supportsAutoUpdate === true && <AutoUpdateGate />}
+      </HotkeySettingsProvider>
+    </Suspense>
   );
 }

@@ -16,7 +16,7 @@ import {
     type ReactNode,
 } from "react"
 import { useTranslation } from "react-i18next"
-import { isTauri, setActiveAsrProvider } from "../lib/ipc"
+import { isTauri, setActiveAsrProvider } from "../../lib/ipc"
 import {
     FOUNDRY_LOCAL_ASR_MODELS,
     SHERPA_ONNX_ASR_MODELS,
@@ -24,15 +24,18 @@ import {
     cancelSherpaOnnxAsrDownload,
     cancelSherpaOnnxAsrPrepare,
     cancelLocalAsrDownload,
+    deleteFoundryLocalAsrModel,
     deleteSherpaOnnxAsrModel,
     deleteLocalAsrModel,
     downloadLocalAsrModel,
     downloadSherpaOnnxAsrModel,
     fetchLocalAsrRemoteInfo,
     fetchSherpaOnnxAsrRemoteInfo,
+    getFoundryLocalAsrModelDir,
     getFoundryLocalAsrCatalog,
     getFoundryLocalAsrStatus,
     getLocalAsrEngineStatus,
+    getLocalAsrModelDir,
     getLocalAsrSettings,
     getSherpaOnnxAsrCatalog,
     getSherpaOnnxAsrModelDir,
@@ -44,7 +47,11 @@ import {
     releaseFoundryLocalAsr,
     releaseLocalAsrEngine,
     releaseSherpaOnnxAsr,
+    revealFoundryLocalAsrModelDir,
+    revealLocalAsrModelDir,
+    revealLocalAsrModelsRoot,
     revealSherpaOnnxAsrModelDir,
+    setLocalAsrModelsBaseDir,
     setFoundryLocalAsrLanguageHint,
     setFoundryLocalAsrModel,
     setFoundryLocalRuntimeSource,
@@ -70,11 +77,27 @@ import {
     type SherpaOnnxLanguageHint,
     type SherpaOnnxModelAlias,
     type SherpaPrepareProgress,
-} from "../lib/localAsr"
-import { useHotkeySettings } from "../state/HotkeySettingsContext"
-import { detectOS } from "../components/WindowChrome"
-import { SelectLite } from "../components/ui/SelectLite"
-import { Btn, Card, PageHeader, Pill } from "./_atoms"
+} from "../../lib/localAsr"
+import { useHotkeySettings } from "../../state/HotkeySettingsContext"
+import { detectOS } from "../../components/WindowChrome"
+import { SelectLite } from "../../components/ui/SelectLite"
+import { Btn, Card, PageHeader, Pill } from "../_atoms"
+import {
+    formatBytes,
+    formatFoundrySizeMb,
+    isFoundryAlias,
+    isSherpaAlias,
+    isWindowsLikePlatform,
+    normalizeFoundryLanguageHintForUi,
+    normalizeFoundryRuntimeSourceForUi,
+    normalizeSherpaLanguageHintForUi,
+} from "./helpers"
+import {
+    DownloadProgressBlock,
+    FoundryPrepareProgressBlock,
+    ModelRow,
+} from "./components"
+import type { RemoteSize } from "./types"
 
 // Foundry Local Whisper 后端只在 Windows 编译实体（foundry_local_sdk 仅 Windows），
 // 非 Windows 平台 runtime 是 stub 永远 unavailable。前端这一页对应的卡片、状态拉取、
@@ -86,13 +109,6 @@ import { Btn, Card, PageHeader, Pill } from "./_atoms"
 // 修法）。
 const IS_WINDOWS = detectOS() === "win"
 const IS_MAC = detectOS() === "mac"
-
-interface RemoteSize {
-    totalBytes: number
-    fileCount: number
-    loading: boolean
-    error: string | null
-}
 
 interface LocalAsrProps {
     /// `embedded=true` 表示作为子组件嵌入「高级」设置页（Settings → Advanced）；
@@ -108,6 +124,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     const { prefs, updatePrefs } = useHotkeySettings()
     const [settings, setSettings] = useState<LocalAsrSettings | null>(null)
     const [models, setModels] = useState<LocalAsrModelStatus[]>([])
+    const [modelDirs, setModelDirs] = useState<Record<string, string>>({})
     const [progress, setProgress] = useState<
         Record<string, LocalAsrDownloadProgress>
     >({})
@@ -116,6 +133,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     )
     const [error, setError] = useState<string | null>(null)
     const [busyModelId, setBusyModelId] = useState<string | null>(null)
+    const [storageBusy, setStorageBusy] = useState(false)
     const [foundryStatus, setFoundryStatus] =
         useState<FoundryLocalAsrStatus | null>(null)
     const [foundryCatalog, setFoundryCatalog] = useState<
@@ -124,11 +142,15 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     const [selectedFoundryAlias, setSelectedFoundryAlias] =
         useState<FoundryLocalAsrModelAlias>("whisper-small")
     const [foundryBusy, setFoundryBusy] = useState<
-        "enable" | "prepare" | "release" | null
+        "enable" | "prepare" | "release" | "delete" | "reveal" | null
     >(null)
     const [foundryProgress, setFoundryProgress] =
         useState<FoundryPrepareProgress | null>(null)
     const [foundryCancelRequested, setFoundryCancelRequested] = useState(false)
+    const [foundryModelDir, setFoundryModelDir] = useState<{
+        alias: FoundryLocalAsrModelAlias
+        dir: string
+    } | null>(null)
     const [sherpaStatus, setSherpaStatus] =
         useState<SherpaOnnxAsrStatus | null>(null)
     const [sherpaCatalog, setSherpaCatalog] = useState<
@@ -167,8 +189,9 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     const foundryRefreshTimer = useRef<number | null>(null)
     const sherpaRefreshTimer = useRef<number | null>(null)
     const sherpaDownloadRefreshTimer = useRef<number | null>(null)
-    const engineStatusTimer = useRef<number | null>(null)
     const foundrySelectionDirty = useRef(false)
+    const selectedFoundryAliasRef =
+        useRef<FoundryLocalAsrModelAlias>("whisper-small")
     const sherpaSelectionDirty = useRef(false)
     const sherpaAnchorRef = useRef<HTMLDivElement>(null)
     const scrollGuard = useRef<{ scroller: HTMLElement; top: number } | null>(
@@ -186,7 +209,8 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     }
 
     const scheduleScrollGuardRestore = () => {
-        window.setTimeout(restoreScrollGuard, 0)
+        // issue #470：立即帧由下面的 rAF + 嵌套 rAF 覆盖（≈0~32ms），故移除等价的 setTimeout(…,0)；
+        // 80ms / 200ms 两枪保留，用于兜住 rAF 之后才发生的异步重排（如图片晚加载）。
         window.setTimeout(restoreScrollGuard, 80)
         window.setTimeout(restoreScrollGuard, 200)
         window.requestAnimationFrame(() => {
@@ -242,6 +266,14 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
+    const setCurrentFoundryAlias = (alias: FoundryLocalAsrModelAlias) => {
+        if (selectedFoundryAliasRef.current !== alias) {
+            setFoundryModelDir(null)
+        }
+        selectedFoundryAliasRef.current = alias
+        setSelectedFoundryAlias(alias)
+    }
+
     const refreshEngineStatus = async () => {
         try {
             const status = await getLocalAsrEngineStatus()
@@ -259,7 +291,8 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 !foundrySelectionDirty.current &&
                 isFoundryAlias(status.activeModel)
             ) {
-                setSelectedFoundryAlias(status.activeModel)
+                setCurrentFoundryAlias(status.activeModel)
+                void refreshFoundryModelDir(status.activeModel)
             }
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err)
@@ -282,6 +315,34 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
             setFoundryCatalog(catalog)
         } catch (err) {
             console.warn("[localAsr] Foundry catalog query failed", err)
+        }
+    }
+
+    const refreshFoundryModelDir = async (
+        modelAlias: FoundryLocalAsrModelAlias,
+    ) => {
+        try {
+            const dir = await getFoundryLocalAsrModelDir(modelAlias)
+            setFoundryModelDir((current) => {
+                if (selectedFoundryAliasRef.current !== modelAlias) {
+                    return current
+                }
+                if (current?.alias === modelAlias && current.dir === dir) {
+                    return current
+                }
+                return {
+                    alias: modelAlias,
+                    dir,
+                }
+            })
+        } catch (err) {
+            console.warn("[localAsr] Foundry model dir query failed", err)
+            setFoundryModelDir((current) =>
+                selectedFoundryAliasRef.current === modelAlias &&
+                current?.alias === modelAlias
+                    ? null
+                    : current,
+            )
         }
     }
 
@@ -336,10 +397,25 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
             ])
             setSettings(s)
             setModels(list)
+            void Promise.all(
+                list.map(async (m) => {
+                    try {
+                        const dir = await getLocalAsrModelDir(m.id)
+                        setModelDirs((current) =>
+                            current[m.id] === dir
+                                ? current
+                                : { ...current, [m.id]: dir },
+                        )
+                    } catch (err) {
+                        console.warn("[localAsr] Qwen3 model dir query failed", err)
+                    }
+                }),
+            )
             void refreshEngineStatus()
             if (IS_WINDOWS) {
                 void refreshFoundryStatus()
                 void refreshFoundryCatalog()
+                void refreshFoundryModelDir(selectedFoundryAlias)
                 void refreshSherpaStatus()
                 void refreshSherpaCatalog()
                 void refreshSherpaModelDir(selectedSherpaAlias)
@@ -439,15 +515,39 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
 
     useEffect(() => {
         void refresh()
-        // 引擎状态每 5s 轮询一次，让 UI 能看到 release 计时器到点后的状态变化
-        engineStatusTimer.current = window.setInterval(() => {
-            void refreshEngineStatus()
-        }, 5000)
         return () => {
-            if (engineStatusTimer.current !== null) {
-                window.clearInterval(engineStatusTimer.current)
-            }
             if (scrollGuardCleanup.current) scrollGuardCleanup.current()
+        }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [])
+
+    // 引擎状态改由后端主动 emit（加载/释放/keepLoadedSecs 变更），前端零轮询。
+    // 挂载时仍拉一次初值，之后 listen `local-asr:engine-changed` 增量更新。
+    // 仅 Tauri 环境（浏览器 dev mock 无事件）。
+    useEffect(() => {
+        if (!isTauri) return
+        void refreshEngineStatus()
+        let unlisten: undefined | (() => void)
+        let cancelled = false
+        ;(async () => {
+            const { listen } = await import("@tauri-apps/api/event")
+            const off = await listen<LocalAsrEngineStatus>(
+                "local-asr:engine-changed",
+                (e) => {
+                    setEngineStatus(e.payload)
+                },
+            )
+            if (cancelled) {
+                off()
+            } else {
+                unlisten = off
+            }
+        })().catch((err) =>
+            console.warn("[localAsr] engine status subscribe failed", err),
+        )
+        return () => {
+            cancelled = true
+            if (unlisten) unlisten()
         }
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [])
@@ -674,6 +774,93 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         }
     }
 
+    // Apple Speech（macOS 系统语音识别）：无模型下载、无凭据，只需把 active
+    // provider 切到 "apple-speech"。复用 setActiveAsrProvider IPC（后端持久化），
+    // 再 updatePrefs 同步本地受控状态。
+    const handleUseAppleSpeech = async () => {
+        try {
+            setError(null)
+            await setActiveAsrProvider("apple-speech")
+            await updatePrefs((current) =>
+                current.activeAsrProvider === "apple-speech"
+                    ? current
+                    : { ...current, activeAsrProvider: "apple-speech" },
+            )
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+        }
+    }
+
+    const applyModelsBaseDir = async (modelsBaseDir: string | null) => {
+        setStorageBusy(true)
+        try {
+            setError(null)
+            const next = await setLocalAsrModelsBaseDir(modelsBaseDir)
+            setSettings((current) =>
+                current
+                    ? {
+                          ...current,
+                          modelsBaseDir: next.modelsBaseDir,
+                          modelsRootDir: next.modelsRootDir,
+                      }
+                    : current,
+            )
+            await refresh()
+            void refreshFoundryModelDir(selectedFoundryAlias)
+            void refreshSherpaModelDir(selectedSherpaAlias)
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+        } finally {
+            setStorageBusy(false)
+        }
+    }
+
+    const handleChooseModelsBaseDir = async () => {
+        if (!isTauri) {
+            await applyModelsBaseDir("~/OpenLessModels")
+            return
+        }
+        const { open } = await import("@tauri-apps/plugin-dialog")
+        const picked = await open({
+            directory: true,
+            multiple: false,
+            title: t("localAsr.storageChooseTitle"),
+        })
+        if (!picked || Array.isArray(picked)) return
+        if (
+            !window.confirm(
+                t("localAsr.storageChangeConfirm", {
+                    path: picked,
+                }),
+            )
+        ) {
+            return
+        }
+        await applyModelsBaseDir(picked)
+    }
+
+    const handleResetModelsBaseDir = async () => {
+        if (
+            !window.confirm(
+                t("localAsr.storageResetConfirm", {
+                    path: settings?.modelsRootDir ?? "",
+                }),
+            )
+        ) {
+            return
+        }
+        await applyModelsBaseDir(null)
+    }
+
+    const handleRevealModelsRoot = async () => {
+        try {
+            setError(null)
+            await revealLocalAsrModelsRoot()
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+        }
+    }
+
     const syncFoundryPrefs = async (
         modelAlias: FoundryLocalAsrModelAlias,
         enableProvider: boolean,
@@ -803,6 +990,43 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
             setError(null)
             await releaseFoundryLocalAsr()
             await refreshFoundryStatus()
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+        } finally {
+            setFoundryBusy(null)
+        }
+    }
+
+    const handleRevealFoundryDir = async () => {
+        setFoundryBusy("reveal")
+        try {
+            setError(null)
+            await revealFoundryLocalAsrModelDir(selectedFoundryAlias)
+            await refreshFoundryModelDir(selectedFoundryAlias)
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+        } finally {
+            setFoundryBusy(null)
+        }
+    }
+
+    const handleDeleteFoundry = async () => {
+        if (
+            !window.confirm(
+                t("localAsr.deleteConfirm", {
+                    name: selectedFoundryDisplayName,
+                }),
+            )
+        ) {
+            return
+        }
+        setFoundryBusy("delete")
+        try {
+            setError(null)
+            await deleteFoundryLocalAsrModel(selectedFoundryAlias)
+            await refreshFoundryStatus()
+            await refreshFoundryCatalog()
+            await refreshFoundryModelDir(selectedFoundryAlias)
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e))
         } finally {
@@ -954,6 +1178,15 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     }
 
     const handleDeleteSherpa = async () => {
+        if (
+            !window.confirm(
+                t("localAsr.deleteConfirm", {
+                    name: selectedSherpaDisplayName,
+                }),
+            )
+        ) {
+            return
+        }
         setSherpaBusy("delete")
         try {
             setError(null)
@@ -1104,6 +1337,15 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
     }
 
     const handleDelete = async (modelId: string) => {
+        if (
+            !window.confirm(
+                t("localAsr.deleteConfirm", {
+                    name: modelId,
+                }),
+            )
+        ) {
+            return
+        }
         setBusyModelId(modelId)
         try {
             await deleteLocalAsrModel(modelId)
@@ -1113,6 +1355,20 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 return next
             })
             await refresh()
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e))
+        } finally {
+            setBusyModelId(null)
+        }
+    }
+
+    const handleRevealModelDir = async (modelId: string) => {
+        setBusyModelId(modelId)
+        try {
+            setError(null)
+            await revealLocalAsrModelDir(modelId)
+            const dir = await getLocalAsrModelDir(modelId)
+            setModelDirs((current) => ({ ...current, [modelId]: dir }))
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e))
         } finally {
@@ -1140,9 +1396,8 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
 
     const handlePreload = async () => {
         try {
+            // 加载完成后后端会 emit `local-asr:engine-changed`，前端零轮询更新状态。
             await preloadLocalAsr()
-            // 触发预加载后给后端几秒，再查状态
-            window.setTimeout(() => void refreshEngineStatus(), 1500)
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e))
         }
@@ -1222,6 +1477,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
         sherpaStatus?.available === true ||
         (foundryPlatformAvailable && sherpaStatus?.available !== false)
     const sherpaDefault = prefs?.activeAsrProvider === "sherpa-onnx-local"
+    const appleSpeechActive = prefs?.activeAsrProvider === "apple-speech"
     const selectedSherpaModel =
         SHERPA_ONNX_ASR_MODELS.find(
             (model) => model.alias === selectedSherpaAlias,
@@ -1400,6 +1656,110 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                 </Card>
             )}
 
+            <Card style={{ marginBottom: 16 }}>
+                <div
+                    style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 12,
+                    }}
+                >
+                    <div
+                        style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            gap: 16,
+                            flexWrap: "wrap",
+                        }}
+                    >
+                        <div style={{ minWidth: 0, flex: "1 1 360px" }}>
+                            <div
+                                style={{
+                                    fontSize: 14,
+                                    fontWeight: 700,
+                                    color: "var(--ol-ink)",
+                                    marginBottom: 6,
+                                }}
+                            >
+                                {t("localAsr.storageTitle")}
+                            </div>
+                            <div
+                                style={{
+                                    fontSize: 12.5,
+                                    color: "var(--ol-ink-3)",
+                                    lineHeight: 1.6,
+                                }}
+                            >
+                                <div>
+                                    <span
+                                        style={{ color: "var(--ol-ink-4)" }}
+                                    >
+                                        {t("localAsr.storageBaseDir")}:{" "}
+                                    </span>
+                                    <code>
+                                        {settings?.modelsBaseDir ??
+                                            t("localAsr.storageDefault")}
+                                    </code>
+                                </div>
+                                <div>
+                                    <span
+                                        style={{ color: "var(--ol-ink-4)" }}
+                                    >
+                                        {t("localAsr.storageModelsRoot")}:{" "}
+                                    </span>
+                                    <code>{settings?.modelsRootDir ?? "—"}</code>
+                                </div>
+                            </div>
+                        </div>
+                        <div
+                            style={{
+                                display: "flex",
+                                gap: 8,
+                                flexWrap: "wrap",
+                                justifyContent: "flex-end",
+                                alignContent: "flex-start",
+                            }}
+                        >
+                            <Btn
+                                variant="primary"
+                                size="sm"
+                                disabled={storageBusy}
+                                onClick={() => void handleChooseModelsBaseDir()}
+                            >
+                                {storageBusy
+                                    ? t("common.loading")
+                                    : t("localAsr.storageChoose")}
+                            </Btn>
+                            <Btn
+                                variant="ghost"
+                                size="sm"
+                                disabled={storageBusy || !settings?.modelsBaseDir}
+                                onClick={() => void handleResetModelsBaseDir()}
+                            >
+                                {t("localAsr.storageReset")}
+                            </Btn>
+                            <Btn
+                                variant="ghost"
+                                size="sm"
+                                disabled={storageBusy}
+                                onClick={() => void handleRevealModelsRoot()}
+                            >
+                                {t("localAsr.storageReveal")}
+                            </Btn>
+                        </div>
+                    </div>
+                    <div
+                        style={{
+                            fontSize: 12,
+                            color: "var(--ol-ink-4)",
+                            lineHeight: 1.55,
+                        }}
+                    >
+                        {t("localAsr.storageDesc")}
+                    </div>
+                </div>
+            </Card>
+
             {IS_WINDOWS && (
                 <Card style={{ marginBottom: 16 }}>
                     <div
@@ -1503,11 +1863,11 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                                                 preserveEmbeddedScroll(
                                                     e.currentTarget,
                                                 )
+                                            const nextAlias = e.target
+                                                .value as FoundryLocalAsrModelAlias
                                             foundrySelectionDirty.current = true
-                                            setSelectedFoundryAlias(
-                                                e.target
-                                                    .value as FoundryLocalAsrModelAlias,
-                                            )
+                                            setCurrentFoundryAlias(nextAlias)
+                                            void refreshFoundryModelDir(nextAlias)
                                             restoreScroll()
                                         }}
                                         disabled={foundryBusy !== null}
@@ -1704,6 +2064,17 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                             </div>
                             <div>
                                 <span style={{ color: "var(--ol-ink-4)" }}>
+                                    {t("localAsr.modelDir")}:{" "}
+                                </span>
+                                <code>
+                                    {foundryModelDir?.alias ===
+                                    selectedFoundryAlias
+                                        ? foundryModelDir.dir
+                                        : "—"}
+                                </code>
+                            </div>
+                            <div>
+                                <span style={{ color: "var(--ol-ink-4)" }}>
                                     {t("localAsr.foundryLoadedModel")}:{" "}
                                 </span>
                                 {foundryStatus?.loadedModelId ??
@@ -1782,6 +2153,26 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                                 {foundryBusy === "release"
                                     ? t("localAsr.foundryReleasing")
                                     : t("localAsr.releaseNow")}
+                            </Btn>
+                            <Btn
+                                variant="ghost"
+                                size="sm"
+                                disabled={foundryBusy !== null}
+                                onClick={() => void handleRevealFoundryDir()}
+                            >
+                                {foundryBusy === "reveal"
+                                    ? t("common.loading")
+                                    : t("localAsr.revealDir")}
+                            </Btn>
+                            <Btn
+                                variant="ghost"
+                                size="sm"
+                                disabled={foundryBusy !== null}
+                                onClick={() => void handleDeleteFoundry()}
+                            >
+                                {foundryBusy === "delete"
+                                    ? t("common.loading")
+                                    : t("localAsr.delete")}
                             </Btn>
                         </div>
                     </div>
@@ -2437,6 +2828,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                         <ModelRow
                             key={model.id}
                             model={model}
+                            modelDir={modelDirs[model.id] ?? ""}
                             remoteSize={remoteSizes[model.id]}
                             progress={progress[model.id]}
                             isActive={settings?.activeModel === model.id}
@@ -2449,6 +2841,7 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                             onDownload={() => void handleDownload(model.id)}
                             onCancel={() => void handleCancel(model.id)}
                             onDelete={() => void handleDelete(model.id)}
+                            onReveal={() => void handleRevealModelDir(model.id)}
                             onSetActive={() =>
                                 void handleSetActiveModel(model.id)
                             }
@@ -2457,566 +2850,72 @@ export function LocalAsr({ embedded = false }: LocalAsrProps = {}) {
                     ))}
                 </div>
             )}
-        </Wrapper>
-    )
-}
 
-function FoundryPrepareProgressBlock({
-    progress,
-    modelCached,
-    cancelRequested,
-}: {
-    progress: FoundryPrepareProgress | null
-    modelCached: boolean
-    cancelRequested: boolean
-}) {
-    const { t } = useTranslation()
-    const stages = [
-        { phase: "runtime", label: t("localAsr.foundryPrepareRuntime") },
-        { phase: "model", label: t("localAsr.foundryPrepareModel") },
-        { phase: "load", label: t("localAsr.foundryPrepareLoad") },
-    ] as const
-    const currentIndex = progress
-        ? stages.findIndex((stage) => stage.phase === progress.phase)
-        : -1
-
-    return (
-        <div
-            style={{
-                padding: "10px 12px",
-                borderRadius: 8,
-                background: "rgba(0,0,0,0.035)",
-                display: "flex",
-                flexDirection: "column",
-                gap: 9,
-            }}
-        >
-            {stages.map((stage, index) => {
-                const finished =
-                    progress?.phase === "finished" || currentIndex > index
-                const skippedCachedModel =
-                    stage.phase === "model" &&
-                    modelCached &&
-                    (progress?.phase === "load" ||
-                        progress?.phase === "finished")
-                const active = progress?.phase === stage.phase
-                const failed = progress?.phase === "failed"
-                const percent =
-                    finished || skippedCachedModel
-                        ? 100
-                        : active
-                          ? Math.max(0, Math.min(100, progress?.percent ?? 0))
-                          : 0
-                const detail = skippedCachedModel
-                    ? t("localAsr.foundryPrepareModelSkipped")
-                    : active
-                      ? progress?.label
-                      : finished
-                        ? t("localAsr.foundryPrepareDone")
-                        : t("localAsr.foundryPrepareWaiting")
-                return (
-                    <div key={stage.phase}>
-                        <div
-                            style={{
-                                display: "flex",
-                                justifyContent: "space-between",
-                                gap: 12,
-                                marginBottom: 5,
-                            }}
-                        >
-                            <span
-                                style={{
-                                    fontSize: 12,
-                                    color: "var(--ol-ink-2)",
-                                    fontWeight: 600,
-                                }}
-                            >
-                                {stage.label}
-                            </span>
-                            <span
-                                style={{
-                                    fontSize: 11,
-                                    color: "var(--ol-ink-4)",
-                                }}
-                            >
-                                {failed
-                                    ? t("localAsr.failed")
-                                    : `${Math.round(percent)}%`}
-                            </span>
-                        </div>
-                        <div
-                            style={{
-                                height: 6,
-                                borderRadius: 3,
-                                overflow: "hidden",
-                                background: "rgba(0,0,0,0.08)",
-                            }}
-                        >
-                            <div
-                                style={{
-                                    height: "100%",
-                                    width: `${percent}%`,
-                                    background: failed
-                                        ? "#d04545"
-                                        : "var(--ol-accent-blue, #2c5cff)",
-                                    transition: "width 120ms linear",
-                                }}
-                            />
-                        </div>
-                        <div
-                            style={{
-                                fontSize: 11,
-                                color: "var(--ol-ink-4)",
-                                marginTop: 4,
-                            }}
-                        >
-                            {detail}
-                        </div>
-                    </div>
-                )
-            })}
-            {cancelRequested && (
-                <div
-                    style={{
-                        fontSize: 11.5,
-                        color: "#8a5a00",
-                        lineHeight: 1.5,
-                    }}
-                >
-                    {t("localAsr.foundryCancelBestEffort")}
-                </div>
-            )}
-            {progress?.phase === "failed" && progress.error && (
-                <div
-                    style={{
-                        fontSize: 11.5,
-                        color: "#9b2c2c",
-                        lineHeight: 1.5,
-                    }}
-                >
-                    {progress.error}
-                </div>
-            )}
-        </div>
-    )
-}
-
-function DownloadProgressBlock({
-    progress,
-    remoteSize,
-    cancelRequested,
-}: {
-    progress?: LocalAsrDownloadProgress
-    remoteSize?: RemoteSize
-    cancelRequested: boolean
-}) {
-    const { t } = useTranslation()
-    const downloadedBytes = progress?.bytesDownloaded ?? 0
-    const totalBytes = progress?.bytesTotal ?? remoteSize?.totalBytes ?? 0
-    const ratio = totalBytes > 0 ? Math.min(1, downloadedBytes / totalBytes) : 0
-    const failed = progress?.phase === "failed"
-    return (
-        <div
-            style={{
-                padding: "10px 12px",
-                borderRadius: 8,
-                background: "rgba(0,0,0,0.035)",
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-            }}
-        >
-            <div
-                style={{
-                    display: "flex",
-                    justifyContent: "space-between",
-                    gap: 12,
-                }}
-            >
-                <span
-                    style={{
-                        fontSize: 12,
-                        color: "var(--ol-ink-2)",
-                        fontWeight: 600,
-                    }}
-                >
-                    {t("localAsr.foundryPrepareModel")}
-                </span>
-                <span style={{ fontSize: 11, color: "var(--ol-ink-4)" }}>
-                    {failed
-                        ? t("localAsr.failed")
-                        : `${Math.round(ratio * 100)}%`}
-                </span>
-            </div>
-            <div
-                style={{
-                    height: 6,
-                    borderRadius: 3,
-                    overflow: "hidden",
-                    background: "rgba(0,0,0,0.08)",
-                }}
-            >
-                <div
-                    style={{
-                        height: "100%",
-                        width: `${ratio * 100}%`,
-                        background: failed
-                            ? "#d04545"
-                            : "var(--ol-accent-blue, #2c5cff)",
-                        transition: "width 120ms linear",
-                    }}
-                />
-            </div>
-            <div style={{ fontSize: 11, color: "var(--ol-ink-4)" }}>
-                {failed
-                    ? `${t("localAsr.failed")}: ${progress?.error ?? ""}`
-                    : `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}` +
-                      (progress?.file ? ` · ${progress.file}` : "")}
-            </div>
-            {cancelRequested && (
-                <div
-                    style={{
-                        fontSize: 11.5,
-                        color: "#8a5a00",
-                        lineHeight: 1.5,
-                    }}
-                >
-                    {t("localAsr.foundryCancelRequested")}
-                </div>
-            )}
-        </div>
-    )
-}
-
-interface ModelRowProps {
-    model: LocalAsrModelStatus
-    remoteSize?: RemoteSize
-    progress?: LocalAsrDownloadProgress
-    isActive: boolean
-    engineAvailable: boolean
-    disabled: boolean
-    testing: boolean
-    testResult?: LocalAsrTestResult | { error: string }
-    onDownload: () => void
-    onCancel: () => void
-    onDelete: () => void
-    onSetActive: () => void
-    onTest: () => void
-}
-
-function ModelRow({
-    model,
-    remoteSize,
-    progress,
-    isActive,
-    engineAvailable,
-    disabled,
-    testing,
-    testResult,
-    onDownload,
-    onCancel,
-    onDelete,
-    onSetActive,
-    onTest,
-}: ModelRowProps) {
-    const { t } = useTranslation()
-    const isDownloading = useMemo(
-        () => progress?.phase === "started" || progress?.phase === "progress",
-        [progress?.phase],
-    )
-    const downloadedBytes = progress?.bytesDownloaded ?? model.downloadedBytes
-    const totalBytes = progress?.bytesTotal ?? remoteSize?.totalBytes ?? 0
-    const ratio = totalBytes > 0 ? Math.min(1, downloadedBytes / totalBytes) : 0
-    // 进度条要保留：有 partial 残留（downloadedBytes>0 但未完整）就一直显示，
-    // 让用户看到上次下到哪里了，再点下载会从那里续。
-    const hasPartial = !model.isDownloaded && model.downloadedBytes > 0
-    const showProgress =
-        isDownloading || progress?.phase === "failed" || hasPartial
-
-    const sizeLabel = remoteSize?.loading
-        ? t("localAsr.sizeLoading")
-        : remoteSize?.error
-          ? t("localAsr.sizeUnknown")
-          : remoteSize && remoteSize.totalBytes > 0
-            ? `${formatBytes(remoteSize.totalBytes)} · ${remoteSize.fileCount} ${t("localAsr.files")}`
-            : t("localAsr.sizeUnknown")
-
-    return (
-        <Card>
-            <div
-                style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: 16,
-                }}
-            >
-                <div style={{ minWidth: 0 }}>
+            {/* Apple Speech（macOS 系统语音识别）：无下载、无凭据，零网络兜底。
+                issue #574。和 Qwen3 模型行平级摆一张卡片即可。 */}
+            {IS_MAC && (
+                <Card style={{ marginTop: 16 }}>
                     <div
                         style={{
                             display: "flex",
                             alignItems: "center",
-                            gap: 8,
-                            marginBottom: 4,
+                            justifyContent: "space-between",
+                            gap: 16,
+                            flexWrap: "wrap",
                         }}
                     >
-                        <div
-                            style={{
-                                fontSize: 14,
-                                fontWeight: 600,
-                                color: "var(--ol-ink)",
-                            }}
-                        >
-                            {model.id}
-                        </div>
-                        {isActive && (
-                            <Pill tone="blue" size="sm">
-                                {t("localAsr.activeBadge")}
-                            </Pill>
-                        )}
-                        {model.isDownloaded && (
-                            <Pill tone="ok" size="sm">
-                                {t("localAsr.downloadedBadge")}
-                            </Pill>
-                        )}
-                    </div>
-                    <div style={{ fontSize: 12, color: "var(--ol-ink-3)" }}>
-                        {model.hfRepo} · {sizeLabel}
-                    </div>
-                    {showProgress && (
-                        <div style={{ marginTop: 10, maxWidth: 420 }}>
+                        <div style={{ minWidth: 0 }}>
                             <div
                                 style={{
-                                    height: 6,
-                                    borderRadius: 3,
-                                    background: "rgba(0,0,0,0.06)",
-                                    overflow: "hidden",
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: 8,
+                                    marginBottom: 4,
                                 }}
                             >
                                 <div
                                     style={{
-                                        width: `${ratio * 100}%`,
-                                        height: "100%",
-                                        background:
-                                            progress?.phase === "failed"
-                                                ? "#d04545"
-                                                : "var(--ol-accent-blue, #2c5cff)",
-                                        transition: "width 120ms linear",
+                                        fontSize: 13,
+                                        fontWeight: 700,
+                                        color: "var(--ol-ink)",
                                     }}
-                                />
+                                >
+                                    {t("localAsr.appleSpeechTitle")}
+                                </div>
+                                {appleSpeechActive && (
+                                    <Pill tone="ok" size="sm">
+                                        {t("localAsr.activeBadge")}
+                                    </Pill>
+                                )}
                             </div>
                             <div
                                 style={{
-                                    fontSize: 11,
-                                    color: "var(--ol-ink-4)",
-                                    marginTop: 6,
+                                    fontSize: 12.5,
+                                    color: "var(--ol-ink-3)",
+                                    lineHeight: 1.6,
                                 }}
                             >
-                                {progress?.phase === "failed"
-                                    ? `${t("localAsr.failed")}: ${progress.error ?? ""}`
-                                    : `${formatBytes(downloadedBytes)} / ${formatBytes(totalBytes)}` +
-                                      (progress?.file
-                                          ? ` · ${progress.file}`
-                                          : "")}
+                                {t("localAsr.appleSpeechDesc")}
                             </div>
                         </div>
-                    )}
-                </div>
-                <div
-                    style={{
-                        display: "flex",
-                        gap: 8,
-                        flexShrink: 0,
-                        flexWrap: "wrap",
-                        justifyContent: "flex-end",
-                        maxWidth: 360,
-                    }}
-                >
-                    {model.isDownloaded ? (
-                        <>
-                            {!isActive && (
-                                <Btn
-                                    variant="blue"
-                                    size="sm"
-                                    disabled={disabled || !engineAvailable}
-                                    onClick={onSetActive}
-                                >
-                                    {t("localAsr.setActive")}
-                                </Btn>
-                            )}
-                            <Btn
-                                variant="primary"
-                                size="sm"
-                                disabled={
-                                    disabled || testing || !engineAvailable
-                                }
-                                onClick={onTest}
-                            >
-                                {testing
-                                    ? t("localAsr.testRunning")
-                                    : t("localAsr.test")}
-                            </Btn>
-                            <Btn
-                                variant="ghost"
-                                size="sm"
-                                disabled={disabled || testing}
-                                onClick={onDelete}
-                            >
-                                {t("localAsr.delete")}
-                            </Btn>
-                        </>
-                    ) : isDownloading ? (
-                        <Btn variant="ghost" size="sm" onClick={onCancel}>
-                            {t("localAsr.cancel")}
+                        <Btn
+                            variant={appleSpeechActive ? "soft" : "primary"}
+                            disabled={appleSpeechActive}
+                            onClick={() => void handleUseAppleSpeech()}
+                        >
+                            {appleSpeechActive
+                                ? t("localAsr.activeBadge")
+                                : t("localAsr.appleSpeechUse")}
                         </Btn>
-                    ) : (
-                        <>
-                            <Btn
-                                variant="primary"
-                                size="sm"
-                                disabled={disabled || !engineAvailable}
-                                onClick={onDownload}
-                            >
-                                {hasPartial
-                                    ? t("localAsr.resume")
-                                    : t("localAsr.download")}
-                            </Btn>
-                            {hasPartial && (
-                                <Btn
-                                    variant="ghost"
-                                    size="sm"
-                                    disabled={disabled}
-                                    onClick={onDelete}
-                                >
-                                    {t("localAsr.delete")}
-                                </Btn>
-                            )}
-                        </>
-                    )}
-                </div>
-            </div>
-            {testResult && <TestResultBlock result={testResult} />}
-        </Card>
-    )
-}
-
-function TestResultBlock({
-    result,
-}: {
-    result: LocalAsrTestResult | { error: string }
-}) {
-    const { t } = useTranslation()
-    const hasError = "error" in result
-    return (
-        <div
-            style={{
-                marginTop: 12,
-                padding: "10px 12px",
-                background: hasError
-                    ? "rgba(255, 220, 220, 0.5)"
-                    : "rgba(0, 0, 0, 0.04)",
-                borderRadius: 8,
-                fontSize: 12.5,
-                color: hasError ? "#9b2c2c" : "var(--ol-ink-2)",
-                lineHeight: 1.6,
-            }}
-        >
-            {hasError ? (
-                <div>
-                    <strong>{t("localAsr.testFailed")}: </strong>
-                    {result.error}
-                </div>
-            ) : (
-                <div
-                    style={{ display: "flex", flexDirection: "column", gap: 4 }}
-                >
-                    <div
-                        style={{
-                            fontSize: 11,
-                            color: "var(--ol-ink-4)",
-                            letterSpacing: ".04em",
-                            textTransform: "uppercase",
-                        }}
-                    >
-                        {t("localAsr.testHeading")}
                     </div>
-                    <div>
-                        <span style={{ color: "var(--ol-ink-4)" }}>
-                            {t("localAsr.testExpected")}:{" "}
-                        </span>
-                        {result.expectedText}
-                    </div>
-                    <div>
-                        <span style={{ color: "var(--ol-ink-4)" }}>
-                            {t("localAsr.testActual")}:{" "}
-                        </span>
-                        <strong>{result.transcribedText || "(空)"}</strong>
-                    </div>
-                    <div style={{ fontSize: 11, color: "var(--ol-ink-4)" }}>
-                        {t("localAsr.testStats", {
-                            audio: (result.audioMs / 1000).toFixed(1),
-                            load: (result.loadMs / 1000).toFixed(1),
-                            transcribe: (result.transcribeMs / 1000).toFixed(1),
-                            backend: result.backend,
-                        })}
-                    </div>
-                </div>
+                </Card>
             )}
-        </div>
+        </Wrapper>
     )
 }
 
-function isFoundryAlias(value: string): value is FoundryLocalAsrModelAlias {
-    return FOUNDRY_LOCAL_ASR_MODELS.some((model) => model.alias === value)
-}
+// Presentational sub-components (FoundryPrepareProgressBlock, DownloadProgressBlock,
+// ModelRow, TestResultBlock) live in ./components — imported at the top of this file.
 
-function isSherpaAlias(value: string): value is SherpaOnnxModelAlias {
-    return SHERPA_ONNX_ASR_MODELS.some((model) => model.alias === value)
-}
-
-function normalizeFoundryLanguageHintForUi(
-    value: string,
-): FoundryLocalAsrLanguageHint {
-    return value === "zh" || value === "en" ? value : ""
-}
-
-function normalizeSherpaLanguageHintForUi(
-    value: string,
-): SherpaOnnxLanguageHint {
-    return value === "zh" ||
-        value === "en" ||
-        value === "ja" ||
-        value === "ko" ||
-        value === "yue"
-        ? value
-        : ""
-}
-
-function normalizeFoundryRuntimeSourceForUi(
-    value: string,
-): FoundryRuntimeSource {
-    return value === "nuget" || value === "ort-nightly" ? value : "auto"
-}
-
-function isWindowsLikePlatform(): boolean {
-    const nav = navigator as Navigator & {
-        userAgentData?: { platform?: string }
-    }
-    const platform =
-        nav.userAgentData?.platform || navigator.platform || navigator.userAgent
-    return /win/i.test(platform)
-}
-
-function formatFoundrySizeMb(
-    fileSizeMb: number | null | undefined,
-): string | null {
-    if (typeof fileSizeMb !== "number" || fileSizeMb <= 0) return null
-    return Math.round(fileSizeMb).toLocaleString()
-}
-
-function formatBytes(n: number): string {
-    if (n < 1024) return `${n} B`
-    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(0)} MB`
-    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
-}
+// Pure UI helpers (alias/language-hint guards, platform detection, size
+// formatting) live in ./helpers — imported at the top of this file.
