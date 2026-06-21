@@ -1,6 +1,6 @@
 #![cfg_attr(target_os = "linux", allow(dead_code, unused_variables))]
 //! User preferences store: a single JSON document held in memory behind a lock,
-//! with a one-time `streamingInsert` default migration on load.
+//! with a one-time `streamingInsert` migration marker on load.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,9 +22,10 @@ fn read_preferences(path: &Path) -> Result<UserPreferences> {
     let prefs = serde_json::from_slice::<UserPreferences>(&bytes)
         .with_context(|| format!("decode failed: {}", path.display()))?;
 
-    // issue #440：老版本可能已把旧默认 `streamingInsert:false` 写进 preferences.json。
-    // 反序列化会在内存里迁到 true，但还必须把迁移标记落盘，否则每次启动都停留在
-    // “旧文件”状态，无法表达用户后续手动关闭后的 durable opt-out。
+    // issue #440 originally migrated legacy `streamingInsert:false` to true.
+    // Keep the marker write, but preserve the actual value: streaming insertion
+    // is opt-in because direct foreground typing can corrupt visible text on
+    // some Windows target apps even when the saved history text is correct.
     let streaming_default_migrated = serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|value| {
@@ -111,7 +112,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn legacy_streaming_insert_false_is_migrated_and_marker_is_persisted() {
+    fn legacy_streaming_insert_false_is_preserved_and_marker_is_persisted() {
         let tmp: PathBuf =
             std::env::temp_dir().join(format!("openless-prefs-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&tmp).expect("create temp dir");
@@ -126,7 +127,7 @@ mod tests {
         .expect("write legacy prefs");
 
         let prefs = read_preferences(&path).expect("read prefs");
-        assert!(prefs.streaming_insert);
+        assert!(!prefs.streaming_insert);
         assert!(prefs.streaming_insert_default_migrated);
 
         let saved: serde_json::Value =
@@ -136,7 +137,7 @@ mod tests {
             saved
                 .get("streamingInsert")
                 .and_then(|value| value.as_bool()),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             saved

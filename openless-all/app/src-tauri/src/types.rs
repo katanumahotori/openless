@@ -790,7 +790,7 @@ pub struct UserPreferences {
     /// 默认 true（自 1.3.2-3 起）—— 流式落字感知延迟低，所有 fallback case 都已经接好，
     /// 让开箱即用就能体验。CJK IME / Codex / Gemini provider 自动回落到一次性路径，
     /// 用户无感。详见上面「限制」段。
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub streaming_insert: bool,
     /// issue #440 的一次性迁移标记。老版本会把默认 `streamingInsert:false`
     /// 写进 preferences.json，升级后仅看 bool 无法区分「老默认」和「用户手动关」。
@@ -997,7 +997,7 @@ struct UserPreferencesWire {
     start_minimized: bool,
     #[serde(default)]
     theme_mode: ThemeMode,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     streaming_insert: bool,
     #[serde(default)]
     streaming_insert_default_migrated: bool,
@@ -1121,12 +1121,7 @@ impl<'de> Deserialize<'de> for UserPreferences {
             None => default_dictation_hotkey_from_legacy(&wire.hotkey, &wire.custom_combo_hotkey)
                 .map_err(serde::de::Error::custom)?,
         };
-        let streaming_insert_default_migrated = wire.streaming_insert_default_migrated;
-        let streaming_insert = if streaming_insert_default_migrated {
-            wire.streaming_insert
-        } else {
-            true
-        };
+        let streaming_insert = wire.streaming_insert;
 
         Ok(Self {
             hotkey: wire.hotkey,
@@ -1935,7 +1930,7 @@ impl Default for UserPreferences {
             polish_context_window_minutes: default_polish_context_window_minutes(),
             start_minimized: false,
             theme_mode: ThemeMode::default(),
-            streaming_insert: true,
+            streaming_insert: false,
             streaming_insert_default_migrated: true,
             streaming_insert_save_clipboard: true,
             auto_update_check: true,
@@ -2854,18 +2849,18 @@ mod tests {
         assert_eq!(from_empty.paste_shortcut, PasteShortcut::CtrlV);
     }
 
-    /// issue #440: 老版本会把默认 `streamingInsert:false` 写进 preferences.json。
-    /// 缺少迁移标记的旧文件统一迁到 true；带有迁移标记后，用户再手动关掉的 false
-    /// 必须保留。
+    /// Streaming insertion is opt-in. It types chunks directly into the foreground
+    /// app, so a bad target app/IME interaction can corrupt visible text even when
+    /// the polished history entry is correct.
     #[test]
-    fn streaming_insert_defaults_to_enabled_for_missing_or_legacy_unmigrated_pref() {
+    fn streaming_insert_defaults_to_disabled_for_missing_or_legacy_unmigrated_pref() {
         let prefs = UserPreferences::default();
-        assert!(prefs.streaming_insert);
+        assert!(!prefs.streaming_insert);
         assert!(prefs.streaming_insert_default_migrated);
         assert!(prefs.streaming_insert_save_clipboard);
 
         let from_empty: UserPreferences = serde_json::from_str("{}").unwrap();
-        assert!(from_empty.streaming_insert);
+        assert!(!from_empty.streaming_insert);
         assert!(from_empty.streaming_insert_default_migrated);
         assert!(from_empty.streaming_insert_save_clipboard);
 
@@ -2876,7 +2871,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert!(from_legacy_false.streaming_insert);
+        assert!(!from_legacy_false.streaming_insert);
         assert!(from_legacy_false.streaming_insert_default_migrated);
     }
 

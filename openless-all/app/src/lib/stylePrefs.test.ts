@@ -73,7 +73,7 @@ const previousPrefs: UserPreferences = {
   startMinimized: false,
   themeMode: 'system',
   updateChannel: 'stable',
-  streamingInsert: true,
+  streamingInsert: false,
   streamingInsertDefaultMigrated: true,
   streamingInsertSaveClipboard: true,
   autoUpdateCheck: true,
