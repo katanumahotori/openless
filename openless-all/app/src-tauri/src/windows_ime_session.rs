@@ -89,26 +89,43 @@ impl WindowsImeSessionController {
     }
 
     pub fn prepare_session(&self) -> PreparedWindowsImeSession {
+        // 日本語 IME 対策（fork 固有）: TSF / OpenLess IME プロファイルへの切替経路を
+        // 完全に無効化する。録音のたびにシステム入力方式を OpenLess IME へ切り替え→
+        // 復元する動作が、変換途中の日本語（特に最後に確定した漢字）の順序を壊し、
+        // あたかもストリーミング挿入のように 1 文字ずつ崩れて見える原因になる。
+        // 常に unavailable を返せば、挿入は必ずクリップボード貼り付け
+        // （allow_non_tsf_insertion_fallback、原子的で順序が崩れない）へ落ちる。
+        // upstream の #665 / #715（TSF をデフォルトで有効化しない方向）とも整合。
         #[cfg(target_os = "windows")]
         {
-            let saved_profile = match self.profile_manager.capture_active_profile() {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    let error = WindowsImeSessionError::Profile(error.to_string());
-                    log::warn!("[windows-ime] capture active profile failed: {error}");
-                    return PreparedWindowsImeSession::unavailable();
-                }
-            };
+            log::info!(
+                "[windows-ime] TSF profile switching disabled for Japanese IME safety; \
+                 insertion will use clipboard fallback"
+            );
+            return PreparedWindowsImeSession::unavailable();
 
-            match self.profile_manager.activate_openless_profile() {
-                Ok(()) => PreparedWindowsImeSession {
-                    saved_profile: Some(saved_profile),
-                    openless_activated: true,
-                },
-                Err(error) => {
-                    let error = WindowsImeSessionError::Profile(error.to_string());
-                    log::warn!("[windows-ime] activate OpenLess profile failed: {error}");
-                    PreparedWindowsImeSession::activation_failed(saved_profile)
+            // 旧 TSF 経路（再有効化する場合は上の return を外す）。
+            #[allow(unreachable_code)]
+            {
+                let saved_profile = match self.profile_manager.capture_active_profile() {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let error = WindowsImeSessionError::Profile(error.to_string());
+                        log::warn!("[windows-ime] capture active profile failed: {error}");
+                        return PreparedWindowsImeSession::unavailable();
+                    }
+                };
+
+                match self.profile_manager.activate_openless_profile() {
+                    Ok(()) => PreparedWindowsImeSession {
+                        saved_profile: Some(saved_profile),
+                        openless_activated: true,
+                    },
+                    Err(error) => {
+                        let error = WindowsImeSessionError::Profile(error.to_string());
+                        log::warn!("[windows-ime] activate OpenLess profile failed: {error}");
+                        PreparedWindowsImeSession::activation_failed(saved_profile)
+                    }
                 }
             }
         }
